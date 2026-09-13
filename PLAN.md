@@ -68,20 +68,21 @@ Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed 
 
 ---
 
-## Phase 1 — Schema for F&O (delivered 2026-09-13, pending apply + verify)
+## Phase 1 — Schema for F&O (schema verified 2026-09-13; registry + Docker delivered, pending apply)
 
 - [x] Live schema captured; extra legacy tables found: `candles_1m`, `market_ticks`, `provider_accounts`, `watchlists`
-- [~] `infra/supabase/migrations/0001_baseline.sql` — idempotent capture of the live schema (enums, tables, indexes, guarded FK, updated_at triggers)
-- [~] `0002_fno.sql` — `instruments` gains `underlying_key`, `underlying_symbol`, `expiry` (date, IST), `strike`, `option_type` (CE/PE), `weekly`, `is_expired` + backfill from metadata; `market_candles.oi`; enum values `1h`,`1d`,`hist`,`hist_expired`; `backfill_jobs`; RLS (authenticated read-only on market data, owner-only on user tables)
-- [~] `0003_drop_legacy.sql` — drops `market_snapshots`, `candles_1m`, `market_ticks` (apply only after row counts confirmed 0)
-- [ ] Regenerate `database.types.ts` via `supabase gen types`
-- [~] `sync-instruments.ts` writes the new typed columns
+- [x] `infra/supabase/migrations/0001_baseline.sql` — idempotent capture of the live schema (enums, tables, indexes, guarded FK, updated_at triggers)
+- [x] `0002_fno.sql` — `instruments` gains `underlying_key`, `underlying_symbol`, `expiry` (date, IST), `strike`, `option_type` (CE/PE), `weekly`, `is_expired` + backfill from metadata; `market_candles.oi`; enum values `1h`,`1d`,`hist`,`hist_expired`; `backfill_jobs`; RLS (authenticated read-only on market data, owner-only on user tables)
+- [x] `0003_drop_legacy.sql` — legacy tables dropped
+- [x] Regenerate `database.types.ts` via `supabase gen types` (CLI login via personal access token from the correct account)
+- [x] `sync-instruments.ts` writes the new typed columns (120,523 rows re-synced)
 - [x] Decisions: keep `ws_failures` (write to it in Phase 4), keep `watchlists`/`provider_accounts` (future API/web; worker tokens stay in env)
-- [ ] Dockerfile + docker-compose; `.env.example` complete
-- [ ] `upstox_accounts` registry in config only (tokens never in DB)
+- [~] `infra/docker/Dockerfile` + `docker-compose.yml` + `.dockerignore`; `.env.example` rewritten
+- [~] `UPSTOX_ACCOUNTS` registry in `config.ts` (roles ws/hist/trade, `plus` flag, legacy single-token fallback) + `config.test.ts`; `WORKER_MODE` now validated (unknown → throws)
 
 ## Phase 2 — F&O daily historical backfill
 
+- [ ] Nightly sync marks instruments absent from the master as `is_active = false`; refresh `underlying_key` for the ~106k older rows that lack it
 - [ ] Enable Upstox Plus (needed for expired-instruments APIs); generate Analytics Token (1-yr, read-only)
 - [ ] Sync instrument master → `instruments` with F&O columns
 - [ ] Underlyings: NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX, BANKEX (confirm list)

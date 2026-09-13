@@ -1,0 +1,25 @@
+# infra/docker/docker-compose.yml — identical on your machine, Render (via Dockerfile), or the Oracle VM.
+#   docker compose -f infra/docker/docker-compose.yml up -d ingest-worker
+#   docker compose -f infra/docker/docker-compose.yml run --rm sync-instruments
+# Env comes from apps/ingest-worker/.env (gitignored). Migration = copy .env + run these two commands.
+
+services:
+  ingest-worker:
+    build:
+      context: ../..
+      dockerfile: infra/docker/Dockerfile
+    image: stock-ingest-worker
+    env_file: ../../apps/ingest-worker/.env
+    environment:
+      WORKER_MODE: websocket-stream
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }
+
+  sync-instruments:
+    image: stock-ingest-worker
+    profiles: [jobs]
+    env_file: ../../apps/ingest-worker/.env
+    command: ["node", "dist/apps/ingest-worker/src/jobs/sync-instruments.js"]
+    restart: "no"
