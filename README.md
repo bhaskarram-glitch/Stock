@@ -4,20 +4,20 @@
 
 apps/
 
-- web — Next.js SSR app
-- api — Node API service
-- ingest-worker — Node worker
+- ingest-worker - Node worker scaffold
 
 packages/
 
-- db — SQL migrations, types, queries
-- market-core — provider adapters and schemas
-- market-upstox — Upstox adapter
-- market-groww — Groww adapter
-- market-kite — Zerodha adapter
-- shared — shared schemas, utils, constants
+- shared - shared market types
+- tsconfig.base.json - shared TypeScript base config
 
 infra/
 
 - render
 - supabase
+
+## Current Status
+
+This repo currently contains a single worker app under `apps/ingest-worker`.
+The instrument sync script in `scripts/sync-instruments.ts` is not implemented yet
+and intentionally exits with an actionable error instead of silently succeeding.
