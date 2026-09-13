@@ -8,8 +8,9 @@
  * Notes:
  * - `complete.json.gz` already contains every exchange/segment; the per-exchange files are only
  *   useful to narrow the download. Don't combine them with `complete` — it just re-uploads the same rows.
- * - F&O fields (expiry, strike, option type, underlying) are captured in `metadata` today.
- *   Phase 1 promotes them to real columns; the mapping below is the only place that changes.
+ * - F&O fields (expiry, strike, option type, underlying) are typed columns (migration 0002).
+ *   Upstox's instrument master only lists *active* contracts; expired ones come from the
+ *   expired-instruments API in the backfill job (Phase 2), not from here.
  * - Exit codes: 0 ok · 1 fatal (DB unreachable, no data, aborted) · 2 completed with some failed batches
  */
 import "dotenv/config.js";
@@ -93,7 +94,28 @@ async function download(url: string): Promise<UpstoxInstrumentRecord[]> {
   return parsed;
 }
 
-export function mapUpstoxInstrument(i: UpstoxInstrumentRecord): InstrumentRow {
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/** Upstox `expiry` is epoch ms; contracts expire at IST end of day → calendar date in IST (YYYY-MM-DD). */
+function expiryDate(value: string | number | undefined): string | null {
+  const ms = num(value);
+  if (ms === null || ms <= 0) return null;
+  return new Date(ms + IST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+function todayIst(): string {
+  return new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+export function mapUpstoxInstrument(
+  i: UpstoxInstrumentRecord,
+  today: string = todayIst(),
+): InstrumentRow {
+  const expiry = expiryDate(i.expiry);
+  const optionType =
+    i.instrument_type === "CE" || i.instrument_type === "PE"
+      ? i.instrument_type
+      : null;
   return {
     provider: "upstox",
     provider_instrument_key: i.instrument_key,
@@ -102,21 +124,25 @@ export function mapUpstoxInstrument(i: UpstoxInstrumentRecord): InstrumentRow {
     trading_symbol: i.trading_symbol ?? i.short_name ?? i.instrument_key,
     name: i.name ?? i.trading_symbol ?? i.instrument_key,
     isin: i.isin ?? null,
+    instrument_type: i.instrument_type ?? null,
+    exchange_token:
+      i.exchange_token === undefined ? null : String(i.exchange_token),
     tick_size: num(i.tick_size),
     lot_size: num(i.lot_size),
+    underlying_key: i.underlying_key ?? null,
+    underlying_symbol: i.underlying_symbol ?? null,
+    expiry,
+    strike: num(i.strike_price),
+    option_type: optionType,
+    weekly: i.weekly ?? null,
+    is_expired: expiry !== null && expiry < today,
     is_active: true,
     metadata: <Json>{
       short_name: i.short_name ?? null,
-      instrument_type: i.instrument_type ?? null,
-      exchange_token: i.exchange_token ?? null,
-      expiry: i.expiry ?? null,
-      strike_price: num(i.strike_price),
-      underlying_key: i.underlying_key ?? null,
-      underlying_symbol: i.underlying_symbol ?? null,
       underlying_type: i.underlying_type ?? null,
-      weekly: i.weekly ?? null,
       freeze_quantity: num(i.freeze_quantity),
       minimum_lot: num(i.minimum_lot),
+      expiry_ms: num(i.expiry),
     },
   };
 }

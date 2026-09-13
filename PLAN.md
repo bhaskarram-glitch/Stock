@@ -49,39 +49,36 @@ Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed 
 - [x] Retry exactly `maxRetries` attempts, injectable (Bug #16)
 - [x] `dotenv.config()` out of websocket-manager.ts (Bug #17)
 
-### 0.3 Cleanup (delivered 2026-09-13, pending apply + verify)
+### 0.3 Cleanup (verified 2026-09-13: tsc clean, 38/38 tests, sync:instruments 120,523 rows / 0 failed)
 
-- [~] Delete legacy trio candleBuilder / instrumentResolver / snapshotWriter + mapper.ts + `upstox-quote`, `snapshot-smoke` modes; index.ts rewritten with `healthcheck` (real DB check) + `websocket-stream` (Bug #10)
-- [~] Single `CandleInterval` + `CandleSource` in `packages/shared/market/types.ts`; aggregator imports type from `@shared` (Bug #9)
-- [~] Delete stale `dist/`, `coverage/`, `.npm-cache/`; new root `.gitignore` covers them
+- [x] Delete legacy trio candleBuilder / instrumentResolver / snapshotWriter + mapper.ts + `upstox-quote`, `snapshot-smoke` modes; index.ts rewritten with `healthcheck` (real DB check) + `websocket-stream` (Bug #10)
+- [x] Single `CandleInterval` + `CandleSource` in `packages/shared/market/types.ts`; aggregator imports type from `@shared` (Bug #9)
+- [x] Delete stale `dist/`, `coverage/`, `.npm-cache/`; new root `.gitignore` covers them
 - [x] Remove `raw: feed` from ticks (Perf #6)
-- [~] `sync-instruments-upstox.js` → `src/jobs/sync-instruments.ts` (TS, shared logger/client, `complete` source by default, F&O fields into `metadata` until Phase 1 columns); delete `sync-instruments-local.ts`, `cleanup-instruments.ts`, `examples/`
+- [x] `sync-instruments-upstox.js` → `src/jobs/sync-instruments.ts` (TS, shared logger/client, `complete` source by default, F&O fields into `metadata` until Phase 1 columns); delete `sync-instruments-local.ts`, `cleanup-instruments.ts`, `examples/`
 - [ ] Delete stray junk file `apps/ingest-worker/{console.error(err)`; delete `packages/shared/market/types.js` (compiled artifact)
 - [ ] Delete `WEBSOCKET_README.md`, `WEBSOCKET_SYSTEM_README.md`, `ARCHITECTURE.md`, `apps/ingest-worker/README.md`
 - [ ] Docs: keep READ.md + PLAN.md; fix or delete root/worker READMEs (Bug #18)
 
 ### 0.4 Verify + commit
 
-- [ ] `tsc --noEmit` clean, all tests pass
-- [ ] Initial commit + push
+- [x] `tsc --noEmit` clean, all tests pass (38/38)
+- [ ] Initial commit + push — NEXT
+- [ ] Create GitHub Issues from remaining PLAN items (tracker switch)
 
 ---
 
-## Phase 1 — Schema for F&O
+## Phase 1 — Schema for F&O (delivered 2026-09-13, pending apply + verify)
 
-- [ ] User provides current live schema
-- [ ] `infra/supabase/migrations/0001_init.sql` — UUID ids; tables:
-  - `instruments` + F&O columns: `underlying_key`, `instrument_type` (FUT/CE/PE/EQ/INDEX), `expiry`, `strike`, `lot_size`, `is_expired`
-  - `market_candles` + `oi` column, `1d` interval, `source` enum gains `hist` / `hist_expired`
-  - `instrument_status`, `ws_failures` (keep; write from WS handlers — Bug #7)
-  - drop `market_snapshots` unless a use appears (Bug #4)
-  - `backfill_jobs` — per (instrument_key, interval, from, to) progress for resumable backfill
+- [x] Live schema captured; extra legacy tables found: `candles_1m`, `market_ticks`, `provider_accounts`, `watchlists`
+- [~] `infra/supabase/migrations/0001_baseline.sql` — idempotent capture of the live schema (enums, tables, indexes, guarded FK, updated_at triggers)
+- [~] `0002_fno.sql` — `instruments` gains `underlying_key`, `underlying_symbol`, `expiry` (date, IST), `strike`, `option_type` (CE/PE), `weekly`, `is_expired` + backfill from metadata; `market_candles.oi`; enum values `1h`,`1d`,`hist`,`hist_expired`; `backfill_jobs`; RLS (authenticated read-only on market data, owner-only on user tables)
+- [~] `0003_drop_legacy.sql` — drops `market_snapshots`, `candles_1m`, `market_ticks` (apply only after row counts confirmed 0)
 - [ ] Regenerate `database.types.ts` via `supabase gen types`
-- [ ] RLS policies for future read-only API role
-- [ ] `upstox_accounts` reference in config only (tokens never in DB)
-- [ ] Dockerfile + docker-compose for worker/backfill; `.env.example` complete
-
----
+- [~] `sync-instruments.ts` writes the new typed columns
+- [x] Decisions: keep `ws_failures` (write to it in Phase 4), keep `watchlists`/`provider_accounts` (future API/web; worker tokens stay in env)
+- [ ] Dockerfile + docker-compose; `.env.example` complete
+- [ ] `upstox_accounts` registry in config only (tokens never in DB)
 
 ## Phase 2 — F&O daily historical backfill
 
