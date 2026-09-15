@@ -68,7 +68,7 @@ Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed 
 
 ---
 
-## Phase 1 — Schema for F&O (schema verified 2026-09-13; registry + Docker delivered, pending apply)
+## Phase 1 — Schema for F&O (COMPLETE 2026-09-13: 44/44 tests)
 
 - [x] Live schema captured; extra legacy tables found: `candles_1m`, `market_ticks`, `provider_accounts`, `watchlists`
 - [x] `infra/supabase/migrations/0001_baseline.sql` — idempotent capture of the live schema (enums, tables, indexes, guarded FK, updated_at triggers)
@@ -77,8 +77,8 @@ Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed 
 - [x] Regenerate `database.types.ts` via `supabase gen types` (CLI login via personal access token from the correct account)
 - [x] `sync-instruments.ts` writes the new typed columns (120,523 rows re-synced)
 - [x] Decisions: keep `ws_failures` (write to it in Phase 4), keep `watchlists`/`provider_accounts` (future API/web; worker tokens stay in env)
-- [~] `infra/docker/Dockerfile` + `docker-compose.yml` + `.dockerignore`; `.env.example` rewritten
-- [~] `UPSTOX_ACCOUNTS` registry in `config.ts` (roles ws/hist/trade, `plus` flag, legacy single-token fallback) + `config.test.ts`; `WORKER_MODE` now validated (unknown → throws)
+- [x] `infra/docker/Dockerfile` + `docker-compose.yml` + `.dockerignore`; `.env.example` rewritten
+- [x] `UPSTOX_ACCOUNTS` registry in `config.ts` (roles ws/hist/trade, `plus` flag, legacy single-token fallback) + `config.test.ts`; `WORKER_MODE` now validated (unknown → throws)
 
 ## Phase 2 — F&O daily historical backfill
 

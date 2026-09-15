@@ -12,7 +12,9 @@
     "test": "vitest",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "test:websocket-smoke": "vitest run src/providers/upstox/websocket-smoke.test.ts"
+    "test:websocket-smoke": "vitest run src/providers/upstox/websocket-smoke.test.ts",
+    "probe:history": "cross-env NODE_OPTIONS=\"--loader ts-node/esm\" node src/jobs/probe-history.ts",
+    "backfill": "cross-env NODE_OPTIONS=\"--loader ts-node/esm\" node src/jobs/backfill-history.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.101.1",
