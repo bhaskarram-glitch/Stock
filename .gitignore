@@ -24,3 +24,6 @@ Thumbs.db
 # logs
 *.log
 npm-debug.log*
+# supabase cli temp
+supabase/.temp/
+**/supabase/.temp/

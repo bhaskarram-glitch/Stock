@@ -1,5 +1,5 @@
 import "dotenv/config.js";
-import { loadConfig } from "./config.js";
+import { describeAccount, loadConfig } from "./config.js";
 import { logger } from "./lib/logger.js";
 import { getSupabaseClient } from "./lib/supabase.js";
 import { createUpstoxClientFromEnv } from "./providers/upstox/client.js";
@@ -35,7 +35,7 @@ async function runHealthcheck(
 
   logger.info("Healthcheck OK", {
     instrumentsInDb: count ?? 0,
-    hasUpstoxToken: Boolean(config.upstoxAccessToken),
+    upstoxAccounts: config.upstoxAccounts.all.map(describeAccount),
   });
 }
 
@@ -47,13 +47,14 @@ async function runWebsocketStream(
       "websocket-stream requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY",
     );
   }
-  if (!config.upstoxAccessToken) {
-    throw new Error("websocket-stream requires UPSTOX_ACCESS_TOKEN");
-  }
+  // Streaming uses the first account holding the `ws` role. Sharding across several ws accounts
+  // (2,000 keys per connection) arrives with Phase 4.
+  const wsAccount = config.upstoxAccounts.require("ws");
+  logger.info("Streaming account", describeAccount(wsAccount));
 
   const supabase = getSupabaseClient();
   const upstoxClient = createUpstoxClientFromEnv(
-    config.upstoxAccessToken,
+    wsAccount.token,
     config.upstoxBaseUrl,
   );
   const candleAggregator = new CandleAggregator(supabase, {
@@ -127,7 +128,7 @@ async function main(): Promise<void> {
   logger.info("Worker starting", {
     workerMode: config.workerMode,
     hasSupabase: config.hasSupabase,
-    hasUpstoxToken: Boolean(config.upstoxAccessToken),
+    upstoxAccounts: config.upstoxAccounts.all.length,
   });
 
   switch (config.workerMode) {

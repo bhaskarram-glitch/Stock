@@ -20,13 +20,14 @@
  * returns them stamped at the 09:15 IST open.
  */
 import "dotenv/config.js";
-import { loadConfig } from "../config.js";
+import { describeAccount, loadConfig } from "../config.js";
 import { logger } from "../lib/logger.js";
 import { getSupabaseClient } from "../lib/supabase.js";
 import type { Database, Json } from "../lib/database.types.js";
 import {
   UpstoxApiError,
   UpstoxHistoricalClient,
+  UpstoxHistoricalClientPool,
   type ExpiredContract,
   type HistoricalCandle,
 } from "../providers/upstox/historical.js";
@@ -43,7 +44,6 @@ type InstrumentRow = Database["public"]["Tables"]["instruments"]["Insert"];
 
 /** Options/futures contract history does not exist before this date (probe, 2026-09-14). */
 const HISTORY_FLOOR = "2024-10-03";
-const CONTRACT_LOOKBACK_DAYS = 1250;
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const CANDLE_BATCH = 500;
 const MAX_RETRIES = 3;
@@ -70,10 +70,6 @@ function addDays(date: string, days: number): string {
   const d = new Date(`${date}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
-}
-
-function earlier(a: string, b: string): string {
-  return a <= b ? a : b;
 }
 
 /** Upstox stamps daily candles at 09:15 IST; normalise to IST midnight (the 1d bucket start). */
@@ -167,7 +163,7 @@ async function writeCandles(
     low: c.low,
     close: c.close,
     volume: c.volume,
-    oi: source === "hist" && (c.oi === 0 || c.oi === null) ? null : c.oi,
+    oi: c.oi,
     source,
   }));
 
@@ -224,7 +220,7 @@ async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
 /** Index spot daily candles for the resolved underlyings. */
 async function backfillSpot(
   db: SupabaseDb,
-  client: UpstoxHistoricalClient,
+  pool: UpstoxHistoricalClientPool,
   underlyings: ResolvedUnderlying[],
   args: Args,
 ): Promise<void> {
@@ -250,7 +246,7 @@ async function backfillSpot(
     }
     try {
       const candles = await withRetry(`spot ${u.symbol}`, () =>
-        client.getHistoricalCandles(u.instrumentKey, "days", 1, from, today),
+        pool.getHistoricalCandles(u.instrumentKey, "days", 1, from, today),
       );
       const written = await writeCandles(
         db,
@@ -285,13 +281,13 @@ async function backfillSpot(
 /** Enumerates expiries for an underlying and records which still need contract listing. */
 async function syncExpiries(
   db: SupabaseDb,
-  client: UpstoxHistoricalClient,
+  pool: UpstoxHistoricalClientPool,
   u: ResolvedUnderlying,
   fromDate: string,
 ): Promise<string[]> {
   const expiries = (
     await withRetry(`expiries ${u.symbol}`, () =>
-      client.getExpiries(u.instrumentKey),
+      pool.getExpiries(u.instrumentKey),
     )
   )
     .filter((e) => e >= fromDate)
@@ -352,7 +348,7 @@ function contractToInstrumentRow(c: ExpiredContract): InstrumentRow {
 /** Contracts + their daily candles for every expiry of every underlying. */
 async function backfillContracts(
   db: SupabaseDb,
-  client: UpstoxHistoricalClient,
+  pool: UpstoxHistoricalClientPool,
   underlyings: ResolvedUnderlying[],
   kind: "options" | "futures",
   args: Args,
@@ -360,7 +356,7 @@ async function backfillContracts(
   let processed = 0;
 
   for (const u of underlyings) {
-    const expiries = await syncExpiries(db, client, u, args.from);
+    const expiries = await syncExpiries(db, pool, u, args.from);
 
     for (const expiry of expiries) {
       if (args.limit && processed >= args.limit) {
@@ -375,8 +371,8 @@ async function backfillContracts(
           `${kind} contracts ${u.symbol} ${expiry}`,
           () =>
             kind === "options"
-              ? client.getExpiredOptionContracts(u.instrumentKey, expiry)
-              : client.getExpiredFutureContracts(u.instrumentKey, expiry),
+              ? pool.getExpiredOptionContracts(u.instrumentKey, expiry)
+              : pool.getExpiredFutureContracts(u.instrumentKey, expiry),
         );
       } catch (error) {
         logger.error("Contract listing failed", {
@@ -455,13 +451,7 @@ async function backfillContracts(
           });
           continue;
         }
-        const windowFrom = earlier(
-          args.from,
-          addDays(c.expiry, -CONTRACT_LOOKBACK_DAYS),
-        );
-        const from = state?.last_date
-          ? addDays(state.last_date, 1)
-          : windowFrom;
+        const from = state?.last_date ? addDays(state.last_date, 1) : args.from;
         if (from > c.expiry) {
           await saveState(db, c.instrument_key, { is_final: true });
           skipped += 1;
@@ -469,7 +459,7 @@ async function backfillContracts(
         }
         try {
           const candles = await withRetry(`candles ${c.trading_symbol}`, () =>
-            client.getExpiredHistoricalCandles(
+            pool.getExpiredHistoricalCandles(
               c.instrument_key,
               "day",
               from,
@@ -486,7 +476,7 @@ async function backfillContracts(
           rows += written;
           loaded += 1;
           await saveState(db, c.instrument_key, {
-            first_date: state?.first_date ?? windowFrom,
+            first_date: state?.first_date ?? args.from,
             last_date: c.expiry,
             is_final: true, // contract is expired and now loaded through expiry
             rows_written: (state?.rows_written ?? 0) + written,
@@ -513,6 +503,8 @@ async function backfillContracts(
         loaded,
         skippedFinal: skipped,
         rows,
+        processed,
+        candleUsage30m: `${pool.usage("expired-candles").lastThirtyMinutes}/${pool.usage("expired-candles").budgetThirtyMinutes}`,
       });
       const { error: expError } = await db.from("underlying_expiries").upsert(
         {
@@ -566,11 +558,23 @@ function parseArgs(argv: string[]): Args {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const config = loadConfig();
-  const account = config.upstoxAccounts.require("hist");
   const db = getSupabaseClient();
-  const client = new UpstoxHistoricalClient(account.token, {
-    baseUrl: config.upstoxBaseUrl,
-  });
+
+  // One client per `hist` account; each client owns one limiter per endpoint family. Upstox limits
+  // are per user, so every extra account adds a full budget. Work is still assigned by this single
+  // loop, one item at a time, so no two accounts ever fetch the same thing.
+  const histAccounts = config.upstoxAccounts.forRole("hist");
+  if (histAccounts.length === 0) config.upstoxAccounts.require("hist"); // throws with guidance
+  const pool = new UpstoxHistoricalClientPool(
+    histAccounts.map(
+      (a) =>
+        new UpstoxHistoricalClient(a.token, {
+          baseUrl: config.upstoxBaseUrl,
+          alias: a.alias,
+        }),
+    ),
+  );
+  logger.info("Upstox accounts", { hist: histAccounts.map(describeAccount) });
 
   const { data: indexRows, error } = await db
     .from("instruments")
@@ -599,16 +603,18 @@ async function main(): Promise<void> {
     target: args.target,
     from: args.from,
     dryRun: args.dryRun,
+    accounts: pool.aliases(),
+    candleRequestsPerHour: pool.size * 1800, // 90% of 2000/h/account
     underlyings: resolved.map((u) => `${u.symbol}=${u.instrumentKey}`),
   });
 
   const started = Date.now();
   if (args.target === "spot" || args.target === "all")
-    await backfillSpot(db, client, resolved, args);
+    await backfillSpot(db, pool, resolved, args);
   if (args.target === "futures" || args.target === "all")
-    await backfillContracts(db, client, resolved, "futures", args);
+    await backfillContracts(db, pool, resolved, "futures", args);
   if (args.target === "options" || args.target === "all")
-    await backfillContracts(db, client, resolved, "options", args);
+    await backfillContracts(db, pool, resolved, "options", args);
 
   logger.info("Backfill finished", {
     target: args.target,

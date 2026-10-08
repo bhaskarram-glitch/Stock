@@ -8,9 +8,13 @@
  *   GET /v2/expired-instruments/future/contract?instrument_key=&expiry_date=        Plus
  *   GET /v2/expired-instruments/historical-candle/{expired_key}/{interval}/{to}/{from}   Plus
  * Candle rows are [ts, open, high, low, close, volume, oi]. Dates are YYYY-MM-DD.
+ *
+ * Rate limits are per API, per user (25/s, 250/min, 1000/30 min). Each client therefore holds one
+ * limiter per endpoint family, and each account gets its own client — see UpstoxHistoricalClientPool.
  */
 import { logger } from "../../lib/logger.js";
 import { DEFAULT_UPSTOX_BASE_URL } from "./client.js";
+import { RateLimiter } from "./rate-limiter.js";
 
 export type HistoricalUnit = "minutes" | "hours" | "days" | "weeks" | "months";
 export type ExpiredInterval =
@@ -75,27 +79,73 @@ interface UpstoxEnvelope<T> {
   errors?: Array<{ errorCode?: string; message?: string }>;
 }
 
+/**
+ * Upstox counts limits per API. Calls that hit the same endpoint share a family; different
+ * families have independent budgets, so listing contracts never slows candle downloads.
+ */
+export type EndpointFamily =
+  | "historical-candles"
+  | "expiries"
+  | "contracts"
+  | "expired-candles";
+
+export const ENDPOINT_FAMILIES: readonly EndpointFamily[] = [
+  "historical-candles",
+  "expiries",
+  "contracts",
+  "expired-candles",
+];
+
+export type LimiterFactory = () => RateLimiter;
+
 export interface UpstoxHistoricalClientOptions {
   baseUrl?: string;
-  /** Minimum spacing between requests in ms (client-side throttle). Default 60ms (~16 req/s). */
-  minIntervalMs?: number;
+  /** Name used in logs. Defaults to "default". */
+  alias?: string;
+  /**
+   * Builds one limiter per endpoint family for this client. Each client MUST own its limiters —
+   * two clients on the same token would double the real request rate.
+   */
+  limiterFactory?: LimiterFactory;
+}
+
+export interface FamilyUsage {
+  lastMinute: number;
+  lastThirtyMinutes: number;
+  blockedForMs: number;
 }
 
 export class UpstoxHistoricalClient {
+  readonly alias: string;
   private readonly baseUrl: string;
-  private readonly minIntervalMs: number;
-  private lastRequestAt = 0;
+  private readonly limiters: Map<EndpointFamily, RateLimiter>;
 
   constructor(
     private readonly accessToken: string,
     options: UpstoxHistoricalClientOptions = {},
   ) {
     this.baseUrl = options.baseUrl ?? DEFAULT_UPSTOX_BASE_URL;
-    this.minIntervalMs = options.minIntervalMs ?? 60;
+    this.alias = options.alias ?? "default";
+    const factory = options.limiterFactory ?? (() => new RateLimiter());
+    this.limiters = new Map(ENDPOINT_FAMILIES.map((f) => [f, factory()]));
+  }
+
+  /** ms until this client may send a request in `family` (0 = now). Used by the pool to choose. */
+  msUntilAllowed(family: EndpointFamily): number {
+    return this.limiter(family).msUntilAllowed();
+  }
+
+  usage(family: EndpointFamily): FamilyUsage {
+    const s = this.limiter(family).stats();
+    return {
+      lastMinute: s.lastMinute,
+      lastThirtyMinutes: s.lastThirtyMinutes,
+      blockedForMs: s.blockedForMs,
+    };
   }
 
   // ---------------------------------------------------------------------------
-  // Public API
+  // API
   // ---------------------------------------------------------------------------
 
   /** Active instrument candles. unit=days interval=1 → daily. Ranges are inclusive. */
@@ -107,13 +157,17 @@ export class UpstoxHistoricalClient {
     toDate: string,
   ): Promise<HistoricalCandle[]> {
     const path = `/v3/historical-candle/${encodeURIComponent(instrumentKey)}/${unit}/${interval}/${toDate}/${fromDate}`;
-    const data = await this.get<{ candles: unknown[][] }>(path);
+    const data = await this.get<{ candles: unknown[][] }>(
+      "historical-candles",
+      path,
+    );
     return (data.candles ?? []).map(parseCandle);
   }
 
-  /** Expiry dates for an underlying — Upstox only returns roughly the last six months. */
+  /** Expiry dates for an underlying (observed range: 2024-10 onwards). */
   async getExpiries(underlyingKey: string): Promise<string[]> {
     const data = await this.get<string[]>(
+      "expiries",
       `/v2/expired-instruments/expiries?instrument_key=${encodeURIComponent(underlyingKey)}`,
     );
     return Array.isArray(data) ? data : [];
@@ -124,6 +178,7 @@ export class UpstoxHistoricalClient {
     expiryDate: string,
   ): Promise<ExpiredContract[]> {
     const data = await this.get<ExpiredContract[]>(
+      "contracts",
       `/v2/expired-instruments/option/contract?instrument_key=${encodeURIComponent(underlyingKey)}&expiry_date=${expiryDate}`,
     );
     return Array.isArray(data) ? data : [];
@@ -134,6 +189,7 @@ export class UpstoxHistoricalClient {
     expiryDate: string,
   ): Promise<ExpiredContract[]> {
     const data = await this.get<ExpiredContract[]>(
+      "contracts",
       `/v2/expired-instruments/future/contract?instrument_key=${encodeURIComponent(underlyingKey)}&expiry_date=${expiryDate}`,
     );
     return Array.isArray(data) ? data : [];
@@ -147,7 +203,10 @@ export class UpstoxHistoricalClient {
     toDate: string,
   ): Promise<HistoricalCandle[]> {
     const path = `/v2/expired-instruments/historical-candle/${encodeURIComponent(expiredInstrumentKey)}/${interval}/${toDate}/${fromDate}`;
-    const data = await this.get<{ candles: unknown[][] }>(path);
+    const data = await this.get<{ candles: unknown[][] }>(
+      "expired-candles",
+      path,
+    );
     return (data.candles ?? []).map(parseCandle);
   }
 
@@ -155,14 +214,15 @@ export class UpstoxHistoricalClient {
   // Transport
   // ---------------------------------------------------------------------------
 
-  private async throttle(): Promise<void> {
-    const wait = this.lastRequestAt + this.minIntervalMs - Date.now();
-    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    this.lastRequestAt = Date.now();
+  private limiter(family: EndpointFamily): RateLimiter {
+    const l = this.limiters.get(family);
+    if (!l) throw new Error(`No limiter for endpoint family "${family}"`);
+    return l;
   }
 
-  private async get<T>(path: string): Promise<T> {
-    await this.throttle();
+  private async get<T>(family: EndpointFamily, path: string): Promise<T> {
+    const limiter = this.limiter(family);
+    await limiter.acquire();
     const url = new URL(path, this.baseUrl);
     const response = await fetch(url, {
       headers: {
@@ -185,7 +245,14 @@ export class UpstoxHistoricalClient {
         `${response.status} ${response.statusText}`;
       const retryAfter = response.headers.get("retry-after");
       const retryAfterMs = retryAfter ? Number(retryAfter) * 1000 : null;
+      if (response.status === 429) {
+        // Our accounting said we were within budget, so the server's window differs from ours.
+        // Pause only this account's family; the others keep working.
+        limiter.penalise(retryAfterMs ?? 60_000);
+      }
       logger.warn("Upstox historical request failed", {
+        account: this.alias,
+        family,
         path: url.pathname,
         status: response.status,
         code,
@@ -235,4 +302,93 @@ export function buildExpiredKey(
 ): string {
   const [y, m, d] = expiryIso.split("-");
   return `${instrumentKey}|${d}-${m}-${y}`;
+}
+
+/**
+ * One client per Upstox account, exposing the same API. Each call is routed to the account that can
+ * send soonest *for that endpoint family* — so N accounts give N times the throughput per family.
+ *
+ * Duplicates are impossible by construction: the pool only chooses which token sends a request;
+ * the caller still decides what to request, one item at a time.
+ */
+export class UpstoxHistoricalClientPool {
+  private cursor = 0;
+
+  constructor(private readonly clients: UpstoxHistoricalClient[]) {
+    if (clients.length === 0)
+      throw new Error("UpstoxHistoricalClientPool needs at least one client");
+  }
+
+  get size(): number {
+    return this.clients.length;
+  }
+
+  aliases(): string[] {
+    return this.clients.map((c) => c.alias);
+  }
+
+  /** The client that can send in `family` soonest; ties rotate so load spreads evenly. */
+  pick(family: EndpointFamily): UpstoxHistoricalClient {
+    const n = this.clients.length;
+    let best = this.clients[this.cursor % n];
+    let bestWait = best.msUntilAllowed(family);
+    for (let i = 1; i < n && bestWait > 0; i++) {
+      const c = this.clients[(this.cursor + i) % n];
+      const wait = c.msUntilAllowed(family);
+      if (wait < bestWait) {
+        best = c;
+        bestWait = wait;
+      }
+    }
+    this.cursor = (this.clients.indexOf(best) + 1) % n;
+    return best;
+  }
+
+  getHistoricalCandles(
+    ...args: Parameters<UpstoxHistoricalClient["getHistoricalCandles"]>
+  ) {
+    return this.pick("historical-candles").getHistoricalCandles(...args);
+  }
+
+  getExpiries(...args: Parameters<UpstoxHistoricalClient["getExpiries"]>) {
+    return this.pick("expiries").getExpiries(...args);
+  }
+
+  getExpiredOptionContracts(
+    ...args: Parameters<UpstoxHistoricalClient["getExpiredOptionContracts"]>
+  ) {
+    return this.pick("contracts").getExpiredOptionContracts(...args);
+  }
+
+  getExpiredFutureContracts(
+    ...args: Parameters<UpstoxHistoricalClient["getExpiredFutureContracts"]>
+  ) {
+    return this.pick("contracts").getExpiredFutureContracts(...args);
+  }
+
+  getExpiredHistoricalCandles(
+    ...args: Parameters<UpstoxHistoricalClient["getExpiredHistoricalCandles"]>
+  ) {
+    return this.pick("expired-candles").getExpiredHistoricalCandles(...args);
+  }
+
+  /** Requests in the last 30 min for `family`, summed across accounts. */
+  usage(family: EndpointFamily): {
+    lastThirtyMinutes: number;
+    budgetThirtyMinutes: number;
+    perAccount: Record<string, number>;
+  } {
+    const perAccount: Record<string, number> = {};
+    let total = 0;
+    for (const c of this.clients) {
+      const used = c.usage(family).lastThirtyMinutes;
+      perAccount[c.alias] = used;
+      total += used;
+    }
+    return {
+      lastThirtyMinutes: total,
+      budgetThirtyMinutes: this.clients.length * 900,
+      perAccount,
+    };
+  }
 }

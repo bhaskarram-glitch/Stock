@@ -31,8 +31,6 @@ export type AppConfig = {
   hasSupabase: boolean;
   upstoxBaseUrl: string;
   upstoxAccounts: UpstoxAccountRegistry;
-  /** @deprecated use `upstoxAccounts.first("ws")`. Kept so existing call sites compile. */
-  upstoxAccessToken: string | null;
   upstoxInstrumentKeys: string[];
 };
 
@@ -64,55 +62,109 @@ function readWorkerMode(env: NodeJS.ProcessEnv): WorkerMode {
   );
 }
 
-/**
- * Parses UPSTOX_ACCOUNTS (JSON array). Example:
- *   [{"alias":"primary","token":"...","roles":["ws","trade"],"plus":true},
- *    {"alias":"analytics","token":"...","roles":["hist","ws"]}]
- * Falls back to UPSTOX_ACCESS_TOKEN (roles ws,trade) and UPSTOX_ANALYTICS_TOKEN (roles hist,ws).
- */
-function readUpstoxAccounts(env: NodeJS.ProcessEnv): UpstoxAccount[] {
-  const raw = readOptional(env, "UPSTOX_ACCOUNTS");
-  if (raw) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (error) {
+const MAX_NUMBERED_ACCOUNTS = 20;
+
+function parseRoles(raw: unknown, where: string): UpstoxAccountRole[] {
+  const list: string[] = Array.isArray(raw)
+    ? raw.map(String)
+    : typeof raw === "string"
+      ? raw
+          .split(",")
+          .map((r) => r.trim())
+          .filter(Boolean)
+      : [];
+  const invalid = list.filter(
+    (r) => !(VALID_ROLES as readonly string[]).includes(r),
+  );
+  if (invalid.length > 0) {
+    throw new Error(
+      `${where}: unknown role(s) ${invalid.join(", ")}. Valid: ${VALID_ROLES.join(", ")}`,
+    );
+  }
+  const roles = Array.from(new Set(list)) as UpstoxAccountRole[];
+  if (roles.length === 0)
+    throw new Error(
+      `${where} needs at least one role of ${VALID_ROLES.join(", ")}`,
+    );
+  return roles;
+}
+
+function parseBool(raw: string | null): boolean {
+  return raw !== null && ["1", "true", "yes", "y"].includes(raw.toLowerCase());
+}
+
+/** UPSTOX_ACCOUNTS='[{"alias":"a1","token":"...","roles":["hist","ws"],"plus":true}, ...]' */
+function readJsonAccounts(raw: string): UpstoxAccount[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(
+      `UPSTOX_ACCOUNTS is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) {
+    throw new Error("UPSTOX_ACCOUNTS must be a non-empty JSON array");
+  }
+  return parsed.map((entry, idx) => {
+    const e = entry as {
+      alias?: unknown;
+      token?: unknown;
+      roles?: unknown;
+      plus?: unknown;
+    };
+    const alias =
+      typeof e.alias === "string" && e.alias.trim()
+        ? e.alias.trim()
+        : `account-${idx + 1}`;
+    if (typeof e.token !== "string" || !e.token.trim()) {
       throw new Error(
-        `UPSTOX_ACCOUNTS is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+        `UPSTOX_ACCOUNTS[${idx}] ("${alias}") is missing "token"`,
       );
     }
-    if (!Array.isArray(parsed) || parsed.length === 0) {
-      throw new Error("UPSTOX_ACCOUNTS must be a non-empty JSON array");
+    return {
+      alias,
+      token: e.token.trim(),
+      roles: parseRoles(e.roles, `UPSTOX_ACCOUNTS[${idx}] ("${alias}")`),
+      plus: e.plus === true,
+    };
+  });
+}
+
+/**
+ * Numbered accounts — easier to edit than one long JSON line:
+ *   UPSTOX_ACCOUNT_1_TOKEN=...        required
+ *   UPSTOX_ACCOUNT_1_ALIAS=acct1      optional, default "account-1"
+ *   UPSTOX_ACCOUNT_1_ROLES=hist,ws    optional, default "hist,ws" (Analytics Tokens are read-only)
+ *   UPSTOX_ACCOUNT_1_PLUS=true        optional, default false
+ * Gaps are allowed (1, 2, 4 is fine). Numbers run 1..20.
+ */
+function readNumberedAccounts(env: NodeJS.ProcessEnv): UpstoxAccount[] {
+  const accounts: UpstoxAccount[] = [];
+  for (let n = 1; n <= MAX_NUMBERED_ACCOUNTS; n++) {
+    const prefix = `UPSTOX_ACCOUNT_${n}_`;
+    const token = readOptional(env, `${prefix}TOKEN`);
+    const alias = readOptional(env, `${prefix}ALIAS`);
+    const rolesRaw = readOptional(env, `${prefix}ROLES`);
+    if (!token) {
+      if (alias || rolesRaw)
+        throw new Error(
+          `${prefix}ALIAS/ROLES set but ${prefix}TOKEN is missing`,
+        );
+      continue;
     }
-    const seen = new Set<string>();
-    return parsed.map((entry, idx) => {
-      const e = entry as Partial<UpstoxAccount>;
-      const alias =
-        typeof e.alias === "string" && e.alias.trim()
-          ? e.alias.trim()
-          : `account-${idx + 1}`;
-      if (seen.has(alias))
-        throw new Error(`UPSTOX_ACCOUNTS: duplicate alias "${alias}"`);
-      seen.add(alias);
-      if (typeof e.token !== "string" || !e.token.trim()) {
-        throw new Error(
-          `UPSTOX_ACCOUNTS[${idx}] ("${alias}") is missing "token"`,
-        );
-      }
-      const roles = Array.isArray(e.roles)
-        ? e.roles.filter((r): r is UpstoxAccountRole =>
-            VALID_ROLES.includes(r as UpstoxAccountRole),
-          )
-        : [];
-      if (roles.length === 0) {
-        throw new Error(
-          `UPSTOX_ACCOUNTS[${idx}] ("${alias}") needs at least one role of ${VALID_ROLES.join(", ")}`,
-        );
-      }
-      return { alias, token: e.token.trim(), roles, plus: e.plus === true };
+    accounts.push({
+      alias: alias ?? `account-${n}`,
+      token,
+      roles: parseRoles(rolesRaw ?? "hist,ws", `${prefix}ROLES`),
+      plus: parseBool(readOptional(env, `${prefix}PLUS`)),
     });
   }
+  return accounts;
+}
 
+/** Legacy single-token vars, kept so older .env files still work. */
+function readLegacyAccounts(env: NodeJS.ProcessEnv): UpstoxAccount[] {
   const accounts: UpstoxAccount[] = [];
   const accessToken = readOptional(env, "UPSTOX_ACCESS_TOKEN");
   if (accessToken)
@@ -133,6 +185,47 @@ function readUpstoxAccounts(env: NodeJS.ProcessEnv): UpstoxAccount[] {
   return accounts;
 }
 
+/**
+ * Account sources, first non-empty wins: UPSTOX_ACCOUNTS (JSON) → UPSTOX_ACCOUNT_<n>_* → legacy vars.
+ * Sources are never merged, so a given setup is defined in exactly one place.
+ */
+function readUpstoxAccounts(env: NodeJS.ProcessEnv): UpstoxAccount[] {
+  const json = readOptional(env, "UPSTOX_ACCOUNTS");
+  const primary = json ? readJsonAccounts(json) : readNumberedAccounts(env);
+  const resolved = primary.length > 0 ? primary : readLegacyAccounts(env);
+
+  const aliases = new Set<string>();
+  const tokens = new Set<string>();
+  for (const a of resolved) {
+    if (aliases.has(a.alias))
+      throw new Error(`Duplicate Upstox account alias "${a.alias}"`);
+    if (tokens.has(a.token)) {
+      // Same token twice = same user = same rate-limit bucket; counting it twice would overshoot the limit.
+      throw new Error(
+        `Upstox account "${a.alias}" reuses a token already configured for another account`,
+      );
+    }
+    aliases.add(a.alias);
+    tokens.add(a.token);
+  }
+  return resolved;
+}
+
+/** Safe for logs: never the token itself, only a short fingerprint to tell accounts apart. */
+export function describeAccount(a: UpstoxAccount): {
+  alias: string;
+  roles: UpstoxAccountRole[];
+  plus: boolean;
+  token: string;
+} {
+  return {
+    alias: a.alias,
+    roles: a.roles,
+    plus: a.plus,
+    token: `…${a.token.slice(-6)}`,
+  };
+}
+
 function buildRegistry(accounts: UpstoxAccount[]): UpstoxAccountRegistry {
   const forRole = (role: UpstoxAccountRole) =>
     accounts.filter((a) => a.roles.includes(role));
@@ -144,7 +237,7 @@ function buildRegistry(accounts: UpstoxAccount[]): UpstoxAccountRegistry {
       const account = forRole(role)[0];
       if (!account) {
         throw new Error(
-          `No Upstox account with role "${role}". Set UPSTOX_ACCOUNTS, or ` +
+          `No Upstox account with role "${role}". Set UPSTOX_ACCOUNT_<n>_TOKEN (+ _ROLES), UPSTOX_ACCOUNTS, or ` +
             (role === "hist"
               ? "UPSTOX_ANALYTICS_TOKEN"
               : "UPSTOX_ACCESS_TOKEN") +
@@ -169,7 +262,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     upstoxBaseUrl:
       readOptional(env, "UPSTOX_BASE_URL") ?? DEFAULT_UPSTOX_BASE_URL,
     upstoxAccounts,
-    upstoxAccessToken: upstoxAccounts.first("ws")?.token ?? null,
     upstoxInstrumentKeys: readCsvList(env, "UPSTOX_INSTRUMENT_KEYS"),
   };
 }

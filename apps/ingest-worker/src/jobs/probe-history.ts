@@ -55,6 +55,7 @@ async function main(): Promise<void> {
   const account = config.upstoxAccounts.require("hist");
   const client = new UpstoxHistoricalClient(account.token, {
     baseUrl: config.upstoxBaseUrl,
+    alias: account.alias,
   });
   logger.info("Probing Upstox history APIs", { account: account.alias });
 

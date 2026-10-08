@@ -5,16 +5,18 @@
   "scripts": {
     "dev": "npx nodemon --watch src --ext ts --exec node --loader ts-node/esm src/index.ts",
     "build": "tsc --project tsconfig.build.json",
-    "start": "npm run build && node dist/apps/ingest-worker/src/index.js",
-    "healthcheck": "npm run build && node dist/apps/ingest-worker/src/index.js",
+    "start": "node dist/apps/ingest-worker/src/index.js",
+    "healthcheck": "cross-env WORKER_MODE=healthcheck node dist/apps/ingest-worker/src/index.js",
+    "docker:build": "docker build -f ../../infra/docker/Dockerfile -t stock-ingest-worker ../..",
     "sync:instruments": "cross-env NODE_OPTIONS=\"--loader ts-node/esm\" node src/jobs/sync-instruments.ts",
+    "probe:history": "cross-env NODE_OPTIONS=\"--loader ts-node/esm\" node src/jobs/probe-history.ts",
+    "backfill": "cross-env NODE_OPTIONS=\"--loader ts-node/esm\" node src/jobs/backfill-history.ts",
+    "accounts:check": "cross-env NODE_OPTIONS=\"--loader ts-node/esm\" node src/jobs/check-accounts.ts",
     "websocket:stream": "cross-env WORKER_MODE=websocket-stream npm run dev",
     "test": "vitest",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "test:websocket-smoke": "vitest run src/providers/upstox/websocket-smoke.test.ts",
-    "probe:history": "cross-env NODE_OPTIONS=\"--loader ts-node/esm\" node src/jobs/probe-history.ts",
-    "backfill": "cross-env NODE_OPTIONS=\"--loader ts-node/esm\" node src/jobs/backfill-history.ts"
+    "test:websocket-smoke": "vitest run src/providers/upstox/websocket-smoke.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.101.1",

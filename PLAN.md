@@ -80,20 +80,51 @@ Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed 
 - [x] `infra/docker/Dockerfile` + `docker-compose.yml` + `.dockerignore`; `.env.example` rewritten
 - [x] `UPSTOX_ACCOUNTS` registry in `config.ts` (roles ws/hist/trade, `plus` flag, legacy single-token fallback) + `config.test.ts`; `WORKER_MODE` now validated (unknown → throws)
 
-## Phase 2 — F&O daily historical backfill
+## Phase 2 — F&O daily historical backfill (started 2026-09-13)
 
-- [ ] Nightly sync marks instruments absent from the master as `is_active = false`; refresh `underlying_key` for the ~106k older rows that lack it
-- [ ] Enable Upstox Plus (needed for expired-instruments APIs); generate Analytics Token (1-yr, read-only)
-- [ ] Sync instrument master → `instruments` with F&O columns
-- [ ] Underlyings: NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX, BANKEX (confirm list)
-- [ ] Enumerate expired contracts: expired expiries → expired option/future contracts per underlying
-- [ ] Index spot daily candles + futures daily candles (Historical V3), from 2022-01-01
-- [ ] Options daily candles: active via Historical V3, expired via expired-instruments API, from 2022-01-01
-- [ ] Backfill runner: rate-limit aware, resumable via `backfill_jobs`, idempotent upsert
-- [ ] Nightly job: append yesterday's daily candles for all active contracts; mark expired (GitHub Actions cron or local until VM)
-- [ ] Data QA: gap detection, duplicate expiry/strike checks, OI sanity
+Verified API facts (probe round 1, 2026-09-13): expired key = `NSE_FO|<token>|DD-MM-YYYY`; candle rows `[ts,o,h,l,c,vol,oi]`; Plus is active.
+**Options/futures history floor is 2024-10-03** — NIFTY expiries returns 102 dates from 2024-10-03 to 2026-09-08, and every 2022 contract request returns 0 rows. Index SPOT daily reaches at least 2010.
+Scope — spot daily for ALL NSE/BSE indices; F&O daily for the 9 derivative indices:
+NSE — Nifty 50 (NIFTY), Nifty Bank (BANKNIFTY), Nifty Financial Services (FINNIFTY), Nifty Midcap Select (MIDCPNIFTY), Nifty Next 50 (NIFTYNXT50), Nifty India FPI 150 (NIFTYFPI);
+BSE — SENSEX, BANKEX, BSE Focused IT (BSEFIT).
 
----
+### 2.0 Probe (decision gate)
+
+- [x] Upstox Plus on; Analytics Token in `.env`
+- [~] `providers/upstox/historical.ts` — read-only client: historical V3, expiries, expired option/future contracts, expired candles; throttled; typed errors (429 / Plus)
+- [~] `jobs/probe-history.ts` — verifies 2022 reach for index daily, expired contracts, expired candles; measures zero-activity share
+- [x] Expiry-date source resolved: Get Expiries covers 2024-10 → today (102 dates for NIFTY); DB rows from old syncs only span 2026-04→2026-06, so Get Expiries is the source. No pre-2024-10 option history exists via Upstox.
+- [x] Probe round 2 (2026-09-14): expired candles work; ~13.9 rows/contract, **0% dead rows**, 100% carry OI, 86 ms/request → NIFTY all 102 expiries ≈ 20,196 contracts / **281,734 rows / ~0.5 h**
+- [x] Storage: no row-skipping needed; all 9 indices project to low millions of rows — stay on Supabase free, migrate to the Oracle VM if it tightens `[open 2 closed]`
+
+### 2.1 Underlyings
+
+- [ ] Index spot daily for all NSE/BSE indices, 2022-01-01 → today (Historical V3; could start earlier — spot reaches 2010+)
+- [ ] Index futures daily (active via V3, expired via expired API)
+
+### 2.2 Backfill runner
+
+- [~] `0004_backfill_state.sql` — `backfill_state` watermarks (replaces unused `backfill_jobs`) + `underlying_expiries`
+- [~] `providers/upstox/indices.ts` — the 9 F&O underlyings, resolved from `instruments` by name (+ tests)
+- [~] `jobs/backfill-history.ts` — targets `spot | options | futures | all`; flags `--symbols --from --limit --dry-run`
+- Incremental rules: expired contracts marked `is_final` and never re-fetched; everything else resumes at `last_date + 1`; enumerated expiries recorded in `underlying_expiries`
+- Daily candles normalised to IST midnight so historical 1d matches the live aggregator's 1d
+- [x] Rate limits confirmed from docs: **25/s, 250/min, 1000/30 min, per API per user**. The 30-min window binds: ~2,000 requests/hour/account → NIFTY (20k contracts) ≈ 10 h on one account.
+- [x] `providers/upstox/rate-limiter.ts` — sliding-window limiter for all three windows, 0.9 safety factor, `penalise()` on 429 (+ tests)
+- [x] Duplicate candles falling in one IST day are merged before upsert (Postgres rejects a batch touching one conflict key twice)
+- [~] Multi-account (2026-09-26): 5 Upstox Plus accounts, each a different user with its own API app
+  - `config.ts` — numbered vars `UPSTOX_ACCOUNT_<n>_TOKEN/_ALIAS/_ROLES/_PLUS` (default roles `hist,ws`); precedence JSON → numbered → legacy, never merged; duplicate alias or reused token rejected at startup; `describeAccount()` logs a 6-char fingerprint only
+  - `historical.ts` — one limiter per **endpoint family** (`historical-candles`, `expiries`, `contracts`, `expired-candles`) per account; 429 pauses only that account+family
+  - `UpstoxHistoricalClientPool` exposes the API directly and routes each call to the account that can send soonest for that family; the job loop still assigns work one item at a time, so no duplicates
+  - `index.ts` streams with `upstoxAccounts.require("ws")`; deprecated `upstoxAccessToken` removed
+  - `jobs/check-accounts.ts` (`npm run accounts:check`) — one call per account + one Plus check, exit 1 on any failure
+- [ ] All 5 tokens in `.env`, `accounts:check` green
+- [ ] Run NIFTY options, then the rest; report actual rows + DB size
+
+### 2.3 Ongoing
+
+- [ ] Nightly job: append yesterday's daily candles for active contracts; mark expired; mark instruments absent from master inactive; refresh `underlying_key` on old rows
+- [ ] Data QA: gap detection, OI sanity
 
 ## Phase 3 — Analysis foundation
 
@@ -146,9 +177,9 @@ Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed 
 
 ## Open decisions
 
-1. Confirm index underlying list (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY, SENSEX, BANKEX)
-2. Oracle Free VM — pending user
-3. Storage beyond Supabase free tier — revisit before stock F&O or intraday-for-all
+1. RESOLVED — expiries come from Get Expiries (2024-10 onwards); no earlier option history is available from Upstox
+2. RESOLVED — measured cost is far lower than estimated (NIFTY ≈ 282k rows); Supabase free for now, Oracle VM later
+3. Oracle Free VM — pending user
 4. Render free tier has no free background workers (to verify at deploy) — nightly backfill via GitHub Actions until then
 
 ## Verified facts (2026-09-10)
