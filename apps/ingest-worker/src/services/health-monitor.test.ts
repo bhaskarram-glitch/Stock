@@ -13,15 +13,14 @@ const mockUpstoxClient = {
   })),
 };
 
-const mockUpdateEq = vi.fn(async () => ({ error: null }));
-const mockUpdate = vi.fn(() => ({ eq: mockUpdateEq }));
-const mockUpsert = vi.fn(async (_rows: unknown, _opts?: unknown) => ({
-  error: null,
-}));
-const mockFrom = vi.fn(() => ({ update: mockUpdate, upsert: mockUpsert }));
-const mockSupabase = { from: mockFrom } as any;
-
 import { HealthMonitor } from "./health-monitor.js";
+import { fakeDb, type FakeDb } from "../test-utils/fake-db.js";
+
+let db: FakeDb;
+const statusUpserts = () =>
+  db.statements.filter((s) => s.text.startsWith('insert into "instrument_status"'));
+const apiTsUpdates = () =>
+  db.statements.filter((s) => s.text.startsWith("update instrument_status"));
 
 describe("HealthMonitor", () => {
   let healthMonitor: HealthMonitor;
@@ -29,9 +28,10 @@ describe("HealthMonitor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useFakeTimers({ shouldAdvanceTime: false });
+    db = fakeDb();
 
     healthMonitor = new HealthMonitor({
-      supabase: mockSupabase,
+      db,
       upstoxClient: mockUpstoxClient as any,
       healthCheckInterval: 1000,
       apiFallbackDelay: 10,
@@ -63,8 +63,8 @@ describe("HealthMonitor", () => {
     await vi.advanceTimersByTimeAsync(15);
 
     expect(mockUpstoxClient.fetchQuote).toHaveBeenCalledWith("NSE_EQ|TEST");
-    expect(mockUpdate).toHaveBeenCalled(); // last_api_ts
-    expect(mockUpsert).toHaveBeenCalled(); // status offline
+    expect(apiTsUpdates().length).toBeGreaterThan(0); // last_api_ts
+    expect(statusUpserts().length).toBeGreaterThan(0); // status offline
     expect(vi.getTimerCount()).toBe(2); // health check + fallback interval
   });
 
@@ -96,32 +96,33 @@ describe("HealthMonitor", () => {
     healthMonitor.start();
     healthMonitor.onWebSocketConnect();
     healthMonitor.addInstruments(["A", "B"]);
-    mockUpsert.mockClear();
+    const before = statusUpserts().length;
 
     for (let i = 0; i < 50; i++) {
       healthMonitor.onTickReceived("A");
       healthMonitor.onTickReceived("B");
     }
-    expect(mockUpsert).not.toHaveBeenCalled(); // nothing written per tick
+    expect(statusUpserts().length).toBe(before); // nothing written per tick
 
     await vi.advanceTimersByTimeAsync(1000);
 
-    expect(mockUpsert).toHaveBeenCalledTimes(1);
-    const rows = mockUpsert.mock.calls[0][0] as Array<{
-      instrument_key: string;
-      last_ws_ts: string;
-    }>;
-    expect(rows.map((r) => r.instrument_key).sort()).toEqual(["A", "B"]);
+    const flushes = statusUpserts().slice(before).filter((s) => s.text.includes('"last_ws_ts"'));
+    expect(flushes).toHaveLength(1);
+    const keys = db
+      .inserted("instrument_status")
+      .filter((r) => r.last_ws_ts !== undefined)
+      .map((r) => r.instrument_key);
+    expect(keys.sort()).toEqual(["A", "B"]);
   });
 
   it("should flush pending timestamps on stop()", () => {
     healthMonitor.start();
     healthMonitor.onWebSocketConnect();
     healthMonitor.onTickReceived("A");
-    mockUpsert.mockClear();
+    const before = statusUpserts().length;
 
     healthMonitor.stop();
-    expect(mockUpsert).toHaveBeenCalledTimes(1);
+    expect(statusUpserts().length).toBe(before + 1);
   });
 
   it("should restore health and cancel fallback when a tick arrives", async () => {
@@ -144,9 +145,9 @@ describe("HealthMonitor", () => {
     expect(status.apiFallbackActive).toBe(false);
   });
 
-  it("should throw when constructed without a client or credentials", () => {
+  it("should throw when constructed without a db", () => {
     expect(
-      () => new HealthMonitor({ upstoxClient: mockUpstoxClient as any }),
-    ).toThrow(/supabase/i);
+      () => new HealthMonitor({ upstoxClient: mockUpstoxClient as any } as any),
+    ).toThrow(/db/i);
   });
 });

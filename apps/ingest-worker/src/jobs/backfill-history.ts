@@ -22,8 +22,8 @@
 import "dotenv/config.js";
 import { describeAccount, loadConfig } from "../config.js";
 import { logger } from "../lib/logger.js";
-import { getSupabaseClient } from "../lib/supabase.js";
-import type { Database, Json } from "../lib/database.types.js";
+import { closeDb, getDb, upsertRows, type Db } from "../lib/db.js";
+import type { CandleInsert, InstrumentInsert, Json } from "../lib/db-types.js";
 import {
   UpstoxApiError,
   UpstoxHistoricalClient,
@@ -38,9 +38,8 @@ import {
   type ResolvedUnderlying,
 } from "../providers/upstox/indices.js";
 
-type SupabaseDb = ReturnType<typeof getSupabaseClient>;
-type CandleRow = Database["public"]["Tables"]["market_candles"]["Insert"];
-type InstrumentRow = Database["public"]["Tables"]["instruments"]["Insert"];
+type CandleRow = CandleInsert;
+type InstrumentRow = InstrumentInsert;
 
 /** Options/futures contract history does not exist before this date (probe, 2026-09-14). */
 const HISTORY_FLOOR = "2024-10-03";
@@ -96,26 +95,24 @@ interface BackfillState {
 }
 
 async function loadStates(
-  db: SupabaseDb,
+  db: Db,
   keys: string[],
 ): Promise<Map<string, BackfillState>> {
   const states = new Map<string, BackfillState>();
   for (let i = 0; i < keys.length; i += 500) {
-    const { data, error } = await db
-      .from("backfill_state")
-      .select("instrument_key, first_date, last_date, is_final, rows_written")
-      .eq("interval", "1d")
-      .in("instrument_key", keys.slice(i, i + 500));
-    if (error)
-      throw new Error(`Failed to load backfill_state: ${error.message}`);
-    for (const row of data ?? [])
-      states.set(row.instrument_key, row as BackfillState);
+    const { rows } = await db.query<BackfillState>(
+      `select instrument_key, first_date, last_date, is_final, rows_written
+         from backfill_state
+        where interval = '1d' and instrument_key = any($1::text[])`,
+      [keys.slice(i, i + 500)],
+    );
+    for (const row of rows) states.set(row.instrument_key, row);
   }
   return states;
 }
 
 async function saveState(
-  db: SupabaseDb,
+  db: Db,
   key: string,
   patch: {
     first_date?: string | null;
@@ -125,20 +122,26 @@ async function saveState(
     last_error?: string | null;
   },
 ): Promise<void> {
-  const { error } = await db.from("backfill_state").upsert(
-    {
-      instrument_key: key,
-      interval: "1d",
-      last_run_at: new Date().toISOString(),
-      ...patch,
-    },
-    { onConflict: "instrument_key,interval" },
-  );
-  if (error)
+  try {
+    await upsertRows(
+      db,
+      "backfill_state",
+      [
+        {
+          instrument_key: key,
+          interval: "1d",
+          last_run_at: new Date().toISOString(),
+          ...patch,
+        },
+      ],
+      { conflict: ["instrument_key", "interval"] },
+    );
+  } catch (error) {
     logger.error("Failed to save backfill_state", {
       instrumentKey: key,
-      error: error.message,
+      error: error instanceof Error ? error.message : String(error),
     });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +149,7 @@ async function saveState(
 // ---------------------------------------------------------------------------
 
 async function writeCandles(
-  db: SupabaseDb,
+  db: Db,
   instrumentId: string,
   instrumentKey: string,
   candles: HistoricalCandle[],
@@ -170,11 +173,15 @@ async function writeCandles(
   let written = 0;
   for (let i = 0; i < rows.length; i += CANDLE_BATCH) {
     const batch = rows.slice(i, i + CANDLE_BATCH);
-    const { error } = await db
-      .from("market_candles")
-      .upsert(batch, { onConflict: "instrument_key,interval,bucket_start" });
-    if (error) throw new Error(`Candle upsert failed: ${error.message}`);
-    written += batch.length;
+    try {
+      written += await upsertRows(db, "market_candles", batch, {
+        conflict: ["instrument_key", "interval", "bucket_start"],
+      });
+    } catch (error) {
+      throw new Error(
+        `Candle upsert failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
   return written;
 }
@@ -219,7 +226,7 @@ async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
 
 /** Index spot daily candles for the resolved underlyings. */
 async function backfillSpot(
-  db: SupabaseDb,
+  db: Db,
   pool: UpstoxHistoricalClientPool,
   underlyings: ResolvedUnderlying[],
   args: Args,
@@ -280,7 +287,7 @@ async function backfillSpot(
 
 /** Enumerates expiries for an underlying and records which still need contract listing. */
 async function syncExpiries(
-  db: SupabaseDb,
+  db: Db,
   pool: UpstoxHistoricalClientPool,
   u: ResolvedUnderlying,
   fromDate: string,
@@ -294,15 +301,19 @@ async function syncExpiries(
     .sort();
 
   if (expiries.length > 0) {
-    const { error } = await db.from("underlying_expiries").upsert(
-      expiries.map((expiry) => ({ underlying_key: u.instrumentKey, expiry })),
-      { onConflict: "underlying_key,expiry", ignoreDuplicates: true },
-    );
-    if (error)
+    try {
+      await upsertRows(
+        db,
+        "underlying_expiries",
+        expiries.map((expiry) => ({ underlying_key: u.instrumentKey, expiry })),
+        { conflict: ["underlying_key", "expiry"], ignoreDuplicates: true },
+      );
+    } catch (error) {
       logger.error("Failed to record expiries", {
         symbol: u.symbol,
-        error: error.message,
+        error: error instanceof Error ? error.message : String(error),
       });
+    }
   }
   logger.info("Expiries synced", {
     symbol: u.symbol,
@@ -347,7 +358,7 @@ function contractToInstrumentRow(c: ExpiredContract): InstrumentRow {
 
 /** Contracts + their daily candles for every expiry of every underlying. */
 async function backfillContracts(
-  db: SupabaseDb,
+  db: Db,
   pool: UpstoxHistoricalClientPool,
   underlyings: ResolvedUnderlying[],
   kind: "options" | "futures",
@@ -397,37 +408,28 @@ async function backfillContracts(
       }
 
       // Register the contracts so market_candles has a valid instrument_id to point at
-      const { error: instError } = await db
-        .from("instruments")
-        .upsert(contracts.map(contractToInstrumentRow), {
-          onConflict: "provider,provider_instrument_key",
+      let idByKey: Map<string, string>;
+      try {
+        await upsertRows(db, "instruments", contracts.map(contractToInstrumentRow), {
+          conflict: ["provider", "provider_instrument_key"],
         });
-      if (instError) {
-        logger.error("Contract instrument upsert failed", {
-          symbol: u.symbol,
-          expiry,
-          error: instError.message,
-        });
-        continue;
-      }
-      const { data: idRows, error: idError } = await db
-        .from("instruments")
-        .select("id, provider_instrument_key")
-        .in(
-          "provider_instrument_key",
-          contracts.map((c) => c.instrument_key),
+        const { rows: idRows } = await db.query<{
+          id: string;
+          provider_instrument_key: string;
+        }>(
+          `select id, provider_instrument_key from instruments
+            where provider = 'upstox' and provider_instrument_key = any($1::text[])`,
+          [contracts.map((c) => c.instrument_key)],
         );
-      if (idError) {
-        logger.error("Contract id lookup failed", {
+        idByKey = new Map(idRows.map((r) => [r.provider_instrument_key, r.id]));
+      } catch (error) {
+        logger.error("Contract registration failed", {
           symbol: u.symbol,
           expiry,
-          error: idError.message,
+          error: error instanceof Error ? error.message : String(error),
         });
         continue;
       }
-      const idByKey = new Map(
-        (idRows ?? []).map((r) => [r.provider_instrument_key, r.id]),
-      );
 
       const states = await loadStates(
         db,
@@ -506,23 +508,29 @@ async function backfillContracts(
         processed,
         candleUsage30m: `${pool.usage("expired-candles").lastThirtyMinutes}/${pool.usage("expired-candles").budgetThirtyMinutes}`,
       });
-      const { error: expError } = await db.from("underlying_expiries").upsert(
-        {
-          underlying_key: u.instrumentKey,
-          expiry,
-          contracts_loaded: true,
-          option_count: kind === "options" ? contracts.length : undefined,
-          future_count: kind === "futures" ? contracts.length : undefined,
-          loaded_at: new Date().toISOString(),
-        },
-        { onConflict: "underlying_key,expiry" },
-      );
-      if (expError)
+      try {
+        await upsertRows(
+          db,
+          "underlying_expiries",
+          [
+            {
+              underlying_key: u.instrumentKey,
+              expiry,
+              contracts_loaded: true,
+              option_count: kind === "options" ? contracts.length : undefined,
+              future_count: kind === "futures" ? contracts.length : undefined,
+              loaded_at: new Date().toISOString(),
+            },
+          ],
+          { conflict: ["underlying_key", "expiry"] },
+        );
+      } catch (error) {
         logger.error("Failed to mark expiry loaded", {
           symbol: u.symbol,
           expiry,
-          error: expError.message,
+          error: error instanceof Error ? error.message : String(error),
         });
+      }
     }
   }
 }
@@ -558,7 +566,7 @@ function parseArgs(argv: string[]): Args {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const config = loadConfig();
-  const db = getSupabaseClient();
+  const db = getDb();
 
   // One client per `hist` account; each client owns one limiter per endpoint family. Upstox limits
   // are per user, so every extra account adds a full budget. Work is still assigned by this single
@@ -576,19 +584,17 @@ async function main(): Promise<void> {
   );
   logger.info("Upstox accounts", { hist: histAccounts.map(describeAccount) });
 
-  const { data: indexRows, error } = await db
-    .from("instruments")
-    .select("id, provider_instrument_key, trading_symbol, name, segment")
-    .in("segment", ["NSE_INDEX", "BSE_INDEX"]);
-  if (error)
-    throw new Error(`Failed to load index instruments: ${error.message}`);
+  const { rows: indexRows } = await db.query<IndexInstrumentRow>(
+    `select id, provider_instrument_key, trading_symbol, name, segment
+       from instruments where segment in ('NSE_INDEX', 'BSE_INDEX')`,
+  );
 
   const wanted = args.symbols
     ? FNO_INDEX_UNDERLYINGS.filter((u) => args.symbols!.includes(u.symbol))
     : FNO_INDEX_UNDERLYINGS;
   const { resolved, unresolved } = resolveUnderlyings(
     wanted,
-    (indexRows ?? []) as IndexInstrumentRow[],
+    indexRows,
   );
 
   if (unresolved.length > 0) {
@@ -622,9 +628,12 @@ async function main(): Promise<void> {
   });
 }
 
-main().catch((error) => {
-  logger.error("Backfill failed", {
-    error: error instanceof Error ? error.message : String(error),
+main()
+  .then(() => closeDb())
+  .catch(async (error) => {
+    logger.error("Backfill failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    await closeDb().catch(() => undefined);
+    process.exit(1);
   });
-  process.exit(1);
-});

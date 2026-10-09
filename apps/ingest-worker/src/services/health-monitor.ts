@@ -1,6 +1,5 @@
 import { logger } from "../lib/logger.js";
-import { createClient, SupabaseClient } from "@supabase/supabase-js";
-import type { Database } from "../lib/database.types.js";
+import { upsertRows, type Db } from "../lib/db.js";
 import { UpstoxClient } from "../providers/upstox/client.js";
 
 export interface HealthStatus {
@@ -11,11 +10,8 @@ export interface HealthStatus {
 }
 
 export interface HealthMonitorOptions {
-  /** Preferred: inject the shared client from lib/supabase.ts (Perf #4). */
-  supabase?: SupabaseClient<Database>;
-  /** Legacy: build a client from url/key. Ignored when `supabase` is provided. */
-  supabaseUrl?: string;
-  supabaseKey?: string;
+  /** Shared pool from lib/db.ts (Perf #4). */
+  db: Db;
   upstoxClient: UpstoxClient;
   healthCheckInterval?: number; // How often to check health + flush WS timestamps (ms)
   apiFallbackDelay?: number; // Delay before triggering API fallback (ms)
@@ -23,7 +19,7 @@ export interface HealthMonitorOptions {
 }
 
 export class HealthMonitor {
-  private supabase: SupabaseClient<Database>;
+  private db: Db;
   private upstoxClient: UpstoxClient;
   private healthCheckInterval: number;
   private apiFallbackDelay: number;
@@ -43,18 +39,8 @@ export class HealthMonitor {
   private pendingWsTs = new Map<string, Date>();
 
   constructor(options: HealthMonitorOptions) {
-    if (options.supabase) {
-      this.supabase = options.supabase;
-    } else if (options.supabaseUrl && options.supabaseKey) {
-      this.supabase = createClient<Database>(
-        options.supabaseUrl,
-        options.supabaseKey,
-      );
-    } else {
-      throw new Error(
-        "HealthMonitor requires `supabase` or `supabaseUrl` + `supabaseKey`",
-      );
-    }
+    if (!options.db) throw new Error("HealthMonitor requires a db");
+    this.db = options.db;
     this.upstoxClient = options.upstoxClient;
     this.healthCheckInterval = options.healthCheckInterval ?? 30_000;
     this.apiFallbackDelay = options.apiFallbackDelay ?? 60_000;
@@ -152,15 +138,9 @@ export class HealthMonitor {
     this.pendingWsTs.clear();
 
     try {
-      const { error } = await this.supabase
-        .from("instrument_status")
-        .upsert(rows, { onConflict: "instrument_key" });
-      if (error) {
-        logger.error("Failed to flush instrument WS timestamps", {
-          count: rows.length,
-          error: error.message,
-        });
-      }
+      await upsertRows(this.db, "instrument_status", rows, {
+        conflict: ["instrument_key"],
+      });
     } catch (error) {
       logger.error("Error flushing instrument WS timestamps", {
         error: error instanceof Error ? error.message : String(error),
@@ -276,24 +256,20 @@ export class HealthMonitor {
     const instrumentKeys = Array.from(this.monitoredInstruments);
 
     try {
-      const { error } = await this.supabase.from("instrument_status").upsert(
+      await upsertRows(
+        this.db,
+        "instrument_status",
         instrumentKeys.map((key) => ({
           instrument_key: key,
           ws_status: status,
           updated_at: new Date().toISOString(),
         })),
-        { onConflict: "instrument_key" },
+        { conflict: ["instrument_key"] },
       );
-      if (error) {
-        logger.error("Failed to update instrument statuses", {
-          error: error.message,
-        });
-      } else {
-        logger.info("Updated instrument statuses", {
-          status,
-          count: instrumentKeys.length,
-        });
-      }
+      logger.info("Updated instrument statuses", {
+        status,
+        count: instrumentKeys.length,
+      });
     } catch (error) {
       logger.error("Error updating instrument statuses", {
         error: error instanceof Error ? error.message : String(error),
@@ -306,19 +282,10 @@ export class HealthMonitor {
     timestamp: Date,
   ): Promise<void> {
     try {
-      const { error } = await this.supabase
-        .from("instrument_status")
-        .update({
-          last_api_ts: timestamp.toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .eq("instrument_key", instrumentKey);
-      if (error) {
-        logger.error("Failed to update instrument API timestamp", {
-          instrumentKey,
-          error: error.message,
-        });
-      }
+      await this.db.query(
+        "update instrument_status set last_api_ts = $1 where instrument_key = $2",
+        [timestamp.toISOString(), instrumentKey],
+      );
     } catch (error) {
       logger.error("Error updating instrument API timestamp", {
         instrumentKey,

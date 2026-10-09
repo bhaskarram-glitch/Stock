@@ -1,0 +1,13 @@
+# infra/docker/Dockerfile.dockerignore — applies to builds using infra/docker/Dockerfile (BuildKit reads
+# <Dockerfile>.dockerignore next to the Dockerfile; a plain .dockerignore here would be ignored because
+# the build context is the repo root). Keeps secrets and junk out of the build context.
+**/node_modules
+**/dist
+**/coverage
+**/.env
+**/.env.*
+!**/.env.example
+**/supabase/.temp
+.npm-cache
+.git
+*.md

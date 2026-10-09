@@ -2,7 +2,7 @@
  * Job: sync the Upstox instrument master into `instruments`.
  *
  * Run: npm run sync:instruments
- * Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ * Env: DATABASE_URL
  *      INSTRUMENT_SOURCES (optional, CSV) — default "complete"; any of complete|NSE|BSE|MCX
  *
  * Notes:
@@ -16,8 +16,8 @@
 import "dotenv/config.js";
 import { gunzipSync } from "node:zlib";
 import { logger } from "../lib/logger.js";
-import { getSupabaseClient } from "../lib/supabase.js";
-import type { Database, Json } from "../lib/database.types.js";
+import { closeDb, getDb, upsertRows, type Db } from "../lib/db.js";
+import type { InstrumentInsert, Json } from "../lib/db-types.js";
 
 const SOURCE_URLS: Record<string, string> = {
   complete:
@@ -53,7 +53,7 @@ interface UpstoxInstrumentRecord {
   minimum_lot?: string | number;
 }
 
-type InstrumentRow = Database["public"]["Tables"]["instruments"]["Insert"];
+type InstrumentRow = InstrumentInsert;
 
 export interface SyncResult {
   total: number;
@@ -148,26 +148,21 @@ export function mapUpstoxInstrument(
 }
 
 /** One cheap query so a paused project / bad URL / bad key fails before any download. */
-async function assertDatabaseReachable(
-  supabase: ReturnType<typeof getSupabaseClient>,
-): Promise<void> {
+async function assertDatabaseReachable(db: Db): Promise<void> {
   try {
-    const { error } = await supabase
-      .from("instruments")
-      .select("id", { head: true, count: "exact" });
-    if (error) throw new Error(error.message);
+    await db.query("select 1 from instruments limit 1");
   } catch (error) {
     const detail = errorDetail(error);
     throw new Error(
-      `Supabase unreachable (${detail.cause ?? detail.error}). ` +
-        "Check the project is not paused and SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are correct.",
+      `Database unreachable (${detail.cause ?? detail.error}). ` +
+        "Check Postgres is running, DATABASE_URL is correct and migrations are applied (npm run db:migrate).",
     );
   }
 }
 
 export async function syncInstruments(sources: string[]): Promise<SyncResult> {
-  const supabase = getSupabaseClient();
-  await assertDatabaseReachable(supabase);
+  const db = getDb();
+  await assertDatabaseReachable(db);
 
   const rowsByKey = new Map<string, InstrumentRow>();
   for (const source of sources) {
@@ -207,10 +202,9 @@ export async function syncInstruments(sources: string[]): Promise<SyncResult> {
   for (let i = 0; i < rows.length; i += BATCH_SIZE) {
     const batch = rows.slice(i, i + BATCH_SIZE);
     try {
-      const { error } = await supabase
-        .from("instruments")
-        .upsert(batch, { onConflict: "provider,provider_instrument_key" });
-      if (error) throw new Error(error.message);
+      await upsertRows(db, "instruments", batch, {
+        conflict: ["provider", "provider_instrument_key"],
+      });
       upserted += batch.length;
       consecutiveFailures = 0;
     } catch (error) {
@@ -252,9 +246,13 @@ if (process.argv[1] && /sync-instruments\.(ts|js)$/.test(process.argv[1])) {
     .filter(Boolean);
 
   syncInstruments(sources)
-    .then(({ failed }) => process.exit(failed > 0 ? 2 : 0))
-    .catch((error) => {
+    .then(async ({ failed }) => {
+      await closeDb();
+      process.exit(failed > 0 ? 2 : 0);
+    })
+    .catch(async (error) => {
       logger.error("Instrument sync failed", errorDetail(error));
+      await closeDb().catch(() => undefined);
       process.exit(1);
     });
 }

@@ -1,25 +1,60 @@
-# infra/docker/docker-compose.yml — identical on your machine, Render (via Dockerfile), or the Oracle VM.
+# infra/docker/docker-compose.yml — the app (worker + jobs). The database is a separate project:
+# infra/db/compose.prod.yml (server) or infra/db/compose.dev.yml (laptop).
+#
+# On the server, from the repo checkout (DB must be up first — it creates the `stock-net` network):
+#   docker compose -f infra/docker/docker-compose.yml build
+#   docker compose -f infra/docker/docker-compose.yml run --rm migrate          # before every deploy
 #   docker compose -f infra/docker/docker-compose.yml up -d ingest-worker
 #   docker compose -f infra/docker/docker-compose.yml run --rm sync-instruments
-# Env comes from apps/ingest-worker/.env (gitignored). Migration = copy .env + run these two commands.
+#   docker compose -f infra/docker/docker-compose.yml run --rm backfill spot     # args go to the job
+#
+# Env comes from apps/ingest-worker/.env (gitignored, chmod 600). Inside this network the DB host is
+# `stock-pg`, e.g. DATABASE_URL=postgresql://stock_app:<pw>@stock-pg:5432/stock
+
+x-app: &app
+  image: stock-ingest-worker
+  env_file: ../../apps/ingest-worker/.env
+  networks: [stock-net]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
 
 services:
   ingest-worker:
+    <<: *app
     build:
       context: ../..
       dockerfile: infra/docker/Dockerfile
-    image: stock-ingest-worker
-    env_file: ../../apps/ingest-worker/.env
     environment:
       WORKER_MODE: websocket-stream
     restart: unless-stopped
-    logging:
-      driver: json-file
-      options: { max-size: "20m", max-file: "5" }
+    stop_grace_period: 30s # time to flush open candles on SIGTERM
+
+  migrate:
+    <<: *app
+    profiles: [jobs]
+    command: ["node", "dist/apps/ingest-worker/src/jobs/migrate.js"]
+    restart: "no"
 
   sync-instruments:
-    image: stock-ingest-worker
+    <<: *app
     profiles: [jobs]
-    env_file: ../../apps/ingest-worker/.env
     command: ["node", "dist/apps/ingest-worker/src/jobs/sync-instruments.js"]
     restart: "no"
+
+  backfill:
+    <<: *app
+    profiles: [jobs]
+    entrypoint: ["node", "dist/apps/ingest-worker/src/jobs/backfill-history.js"]
+    command: ["all"]
+    restart: "no"
+
+  check-accounts:
+    <<: *app
+    profiles: [jobs]
+    command: ["node", "dist/apps/ingest-worker/src/jobs/check-accounts.js"]
+    restart: "no"
+
+networks:
+  stock-net:
+    external: true

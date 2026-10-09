@@ -1,7 +1,7 @@
 import "dotenv/config.js";
 import { describeAccount, loadConfig } from "./config.js";
 import { logger } from "./lib/logger.js";
-import { getSupabaseClient } from "./lib/supabase.js";
+import { closeDb, getDb } from "./lib/db.js";
 import { createUpstoxClientFromEnv } from "./providers/upstox/client.js";
 import {
   CandleAggregator,
@@ -23,45 +23,38 @@ const DEFAULT_INSTRUMENTS = [
 async function runHealthcheck(
   config: ReturnType<typeof loadConfig>,
 ): Promise<void> {
-  if (!config.hasSupabase) {
-    throw new Error(
-      "healthcheck requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY",
-    );
-  }
-  const { error, count } = await getSupabaseClient()
-    .from("instruments")
-    .select("id", { count: "exact", head: true });
-  if (error) throw new Error(`Supabase unreachable: ${error.message}`);
+  if (!config.databaseUrl) throw new Error("healthcheck requires DATABASE_URL");
+  // Planner estimate, not count(*): instant even on a multi-million-row table.
+  const { rows } = await getDb().query<{ estimate: number }>(
+    "select greatest(reltuples, 0)::bigint as estimate from pg_class where oid = 'public.instruments'::regclass",
+  );
 
   logger.info("Healthcheck OK", {
-    instrumentsInDb: count ?? 0,
+    instrumentsInDbApprox: rows[0]?.estimate ?? 0,
     upstoxAccounts: config.upstoxAccounts.all.map(describeAccount),
   });
+  await closeDb();
 }
 
 async function runWebsocketStream(
   config: ReturnType<typeof loadConfig>,
 ): Promise<void> {
-  if (!config.hasSupabase) {
-    throw new Error(
-      "websocket-stream requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY",
-    );
-  }
+  if (!config.databaseUrl) throw new Error("websocket-stream requires DATABASE_URL");
   // Streaming uses the first account holding the `ws` role. Sharding across several ws accounts
   // (2,000 keys per connection) arrives with Phase 4.
   const wsAccount = config.upstoxAccounts.require("ws");
   logger.info("Streaming account", describeAccount(wsAccount));
 
-  const supabase = getSupabaseClient();
+  const db = getDb();
   const upstoxClient = createUpstoxClientFromEnv(
     wsAccount.token,
     config.upstoxBaseUrl,
   );
-  const candleAggregator = new CandleAggregator(supabase, {
+  const candleAggregator = new CandleAggregator(db, {
     activeIntervals: ACTIVE_INTERVALS,
   });
   const healthMonitor = new HealthMonitor({
-    supabase,
+    db,
     upstoxClient,
     healthCheckInterval: 30_000,
     apiFallbackDelay: 60_000,
@@ -110,7 +103,8 @@ async function runWebsocketStream(
     logger.info("Shutting down", { signal });
     clearInterval(statusInterval);
     try {
-      await wsManager.stop();
+      await wsManager.stop(); // flushes open candles before the pool closes
+      await closeDb();
       process.exit(0);
     } catch (error) {
       logger.error("Shutdown error", {
@@ -127,7 +121,7 @@ async function main(): Promise<void> {
   const config = loadConfig();
   logger.info("Worker starting", {
     workerMode: config.workerMode,
-    hasSupabase: config.hasSupabase,
+    hasDatabase: Boolean(config.databaseUrl),
     upstoxAccounts: config.upstoxAccounts.all.length,
   });
 

@@ -1,0 +1,50 @@
+# infra/db/compose.prod.yml — production Postgres, deployed at /opt/stock-db/compose.yml on the server.
+# Kept in the repo so the DB setup is reproducible on any host (Oracle VM today, Pi / own box later).
+#
+# Separate Compose project from the app on purpose: redeploying the worker never restarts the DB.
+# Owns the `stock-net` network; the worker joins it and reaches the DB as host `stock-pg`.
+#
+# Deploy / update on the server:
+#   cp infra/db/compose.prod.yml /opt/stock-db/compose.yml
+#   cd /opt/stock-db && docker compose up -d
+# Secrets: /opt/stock-db/.env (POSTGRES_USER/PASSWORD/DB), chmod 600, never committed.
+#
+# Never change the image to a new MAJOR version (17 → 18) by editing this line: a major upgrade
+# needs pg_dump/restore or pg_upgrade, otherwise Postgres refuses to start on the old data.
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: stock-pg
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:5432:5432" # host-local only; laptop access is an SSH tunnel over Tailscale
+    volumes:
+      - /data/postgres:/var/lib/postgresql/data # 150 GB block volume mounted at /data
+    shm_size: 1g
+    networks: [stock-net]
+    command: >
+      postgres
+      -c shared_buffers=4GB
+      -c effective_cache_size=12GB
+      -c maintenance_work_mem=1GB
+      -c work_mem=32MB
+      -c max_wal_size=4GB
+      -c checkpoint_completion_target=0.9
+      -c wal_compression=on
+      -c random_page_cost=1.1
+      -c log_min_duration_statement=1000
+      -c timezone=UTC
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+networks:
+  stock-net:
+    name: stock-net

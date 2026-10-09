@@ -1,6 +1,5 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
 import { logger } from "../lib/logger.js";
-import type { Database } from "../lib/database.types.js";
+import { upsertRows, type Db } from "../lib/db.js";
 import type { CandleInterval } from "@shared/market/types.js";
 export type { CandleInterval };
 
@@ -73,7 +72,7 @@ export class CandleAggregator {
   private droppedLateTicks = 0;
 
   constructor(
-    private readonly supabase: SupabaseClient<Database>,
+    private readonly db: Db,
     options: CandleAggregatorOptions = {},
   ) {
     this.activeIntervals = options.activeIntervals ?? ["1m", "5m", "15m", "1h"];
@@ -95,19 +94,22 @@ export class CandleAggregator {
     );
     if (missing.length === 0) return [];
 
-    const { data, error } = await this.supabase
-      .from("instruments")
-      .select("id, provider_instrument_key")
-      .in("provider_instrument_key", missing);
-
-    if (error) {
+    try {
+      const { rows } = await this.db.query<{
+        id: string;
+        provider_instrument_key: string;
+      }>(
+        "select id, provider_instrument_key from instruments where provider_instrument_key = any($1::text[])",
+        [missing],
+      );
+      for (const row of rows) {
+        this.instrumentIdCache.set(row.provider_instrument_key, row.id);
+      }
+    } catch (error) {
       logger.error("Failed to preload instrument ids", {
-        error: error.message,
+        error: error instanceof Error ? error.message : String(error),
       });
       return missing;
-    }
-    for (const row of data ?? []) {
-      this.instrumentIdCache.set(row.provider_instrument_key, row.id);
     }
     return missing.filter((k) => !this.instrumentIdCache.has(k));
   }
@@ -338,14 +340,14 @@ export class CandleAggregator {
       }));
     if (rows.length === 0) return;
 
-    const { error } = await this.supabase
-      .from("market_candles")
-      .upsert(rows, { onConflict: "instrument_key,interval,bucket_start" });
-
-    if (error) {
+    try {
+      await upsertRows(this.db, "market_candles", rows, {
+        conflict: ["instrument_key", "interval", "bucket_start"],
+      });
+    } catch (error) {
       logger.error("Failed to save candles", {
         count: rows.length,
-        error: error.message,
+        error: error instanceof Error ? error.message : String(error),
       });
       return;
     }

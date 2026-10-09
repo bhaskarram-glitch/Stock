@@ -3,7 +3,8 @@
 Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[?n]` blocked on Open Decision n
 Rules: no commit until Phase 0 is complete. GitHub Issues become the tracker after the first commit.
 Direction: index F&O daily history (from 2022-01-01) first → live WS for indexes stored at 1h → analysis → trading.
-Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed (one token per role); Render + Supabase now, migrate to Oracle Free VM later with zero-friction.
+Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed (one token per role).
+Decided 2026-09-27: host on an Oracle Cloud Always Free VM (prod) with self-hosted Postgres 17 — Supabase and Render are retired once Phase H is done. Laptop (Windows) = dev. Raspberry Pi / own machine possible later.
 
 ## How to work on this repo (for any agent picking this up)
 
@@ -15,9 +16,13 @@ Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed 
 
 - `apps/ingest-worker/src/providers/<vendor>/` — vendor API clients, WS clients, decoders, vendor payload types (`upstox/`, later `kite/`, `groww/`)
 - `apps/ingest-worker/src/services/` — provider-agnostic domain logic (aggregation, health, volume tracking)
-- `apps/ingest-worker/src/lib/` — cross-cutting: logger, Supabase client, DB types, config helpers
+- `apps/ingest-worker/src/lib/` — cross-cutting: logger, `db.ts` (pg pool + `upsertRows`), `db-types.ts` (row shapes), config helpers
+- `apps/ingest-worker/src/test-utils/` — test doubles (e.g. `fake-db.ts`); excluded from the build
 - `apps/ingest-worker/src/jobs/` — one-off / scheduled entry points (instrument sync, backfill, nightly append)
-- `infra/supabase/migrations/NNNN_name.sql` — schema as code; `infra/docker/` — Dockerfile + compose
+- `infra/db/migrations/NNNN_name.sql` — schema as code, applied by `npm run db:migrate`; never edit an applied file, add a new one
+- `infra/db/` — Postgres compose (`compose.prod.yml` → server `/opt/stock-db/compose.yml`, `compose.dev.yml` for the laptop)
+- `infra/docker/` — app Dockerfile (+ `Dockerfile.dockerignore`) + compose (worker and jobs)
+- `infra/supabase/` — legacy Supabase migrations, kept only until the data move (H6) is verified, then deleted
 - `packages/shared/` — types shared across apps only
 - Tests colocated: `<file>.test.ts` next to the file. Live/integration tests: `<file>.smoke.test.ts`
 - Docs: `READ.md` + `PLAN.md` at repo root only. No other README/ARCHITECTURE files.
@@ -25,7 +30,8 @@ Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed 
 ## Cross-cutting constraints (apply to every phase)
 
 - Portable: Dockerfile + docker-compose, all config via env, no Render-specific features, plain SQL migrations. Migration = copy `.env` + `docker compose up`.
-- Account registry: `UPSTOX_ACCOUNTS` JSON (alias → token, roles: `hist`, `ws-1`, `ws-2`, `trade`); provider calls take an account handle, never a global token.
+- Account registry: numbered `UPSTOX_ACCOUNT_<n>_*` vars (or `UPSTOX_ACCOUNTS` JSON); roles `hist`, `ws`, `trade`; provider calls take an account handle, never a global token.
+- Database: `DATABASE_URL` = `stock_app` (data read/write only); `MIGRATION_DATABASE_URL` = `stock_migrator` (schema owner, migrations only).
 - Every job idempotent + resumable (upsert on unique keys, progress table).
 
 ---
@@ -126,6 +132,29 @@ BSE — SENSEX, BANKEX, BSE Focused IT (BSEFIT).
 - [ ] Nightly job: append yesterday's daily candles for active contracts; mark expired; mark instruments absent from master inactive; refresh `underlying_key` on old rows
 - [ ] Data QA: gap detection, OI sanity
 
+## Phase H — Hosting on Oracle VM + self-hosted Postgres (started 2026-09-27)
+
+Prod = `stock-prod-01`, Oracle Cloud ap-mumbai-1, Ampere A1.Flex 4 OCPU / 24 GB, Ubuntu 24.04 Minimal aarch64, 50 GB boot + 150 GB data volume at `/data`.
+Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
+
+- [x] H1 — VM created (after "out of host capacity" retries via Resource Manager stack), renamed, SSH key login, ₹1 budget alert, Oracle-managed encryption, agent plugins, 150 GB block volume attached
+- [x] H2 — hardening: auto security updates (reboot 02:30 IST), Asia/Kolkata + chrony on Oracle NTP, 2 GB swap, Tailscale (key expiry off, MagicDNS), SSH keys-only/no root, fail2ban, public port 22 closed, weekly boot-volume backup policy (3 kept)
+- [~] H3 — `/data` (ext4, nofail, by UUID); Docker with log caps and `RequiresMountsFor=/data`; Postgres 17 container `stock-pg` on 127.0.0.1:5432 (`/opt/stock-db`); DB `stock`, roles `stock_migrator` + `stock_app`; laptop access via `stockdb` PowerShell shortcut (psql on the server). Pending: password-login test, reboot test
+- [~] H4 — repo off Supabase (2026-10-09):
+  - `supabase-js` → `pg`; `src/lib/db.ts` (pool, DATE as string, `upsertRows` with chunking + in-batch dedupe), `src/lib/db-types.ts`
+  - `infra/db/migrations/0001_init.sql` — consolidated schema (gen_random_uuid, no RLS, live `provider` enum, redundant indexes dropped)
+  - `src/jobs/migrate.ts` (`npm run db:migrate`, `db:status`) — once-only, per-file transaction, advisory lock, checksum guard
+  - Config: `DATABASE_URL` / `MIGRATION_DATABASE_URL` replace `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY`
+  - Docker: migrations in image; compose jobs `migrate`, `sync-instruments`, `backfill`, `check-accounts`; worker joins `stock-net`, DB host `stock-pg`; `.dockerignore` fixed (was never applied)
+  - `infra/db/compose.prod.yml`, `compose.dev.yml`, `init-roles.dev.sql`
+  - Deleted: `lib/supabase.ts`, `lib/database.types.ts`, `schema-websocket.sql`
+  - Integration test `src/lib/db.integration.test.ts` (runs when `TEST_DATABASE_URL` is set)
+  - [ ] User applies + pushes
+- [ ] H5 — laptop dev: WSL2 Ubuntu + Docker Desktop + Node; `compose.dev.yml`; deferred until needed (decided 2026-10-08: nothing installed on the laptop yet)
+- [ ] H6 — data move: schema-only diff vs live Supabase, `pg_dump --data-only` → restore on VM, row counts + `backfill_state` match, Supabase kept read-only 1 week then retired; delete `infra/supabase/`
+- [ ] H7 — deploy: clone on VM, `.env` 600, `accounts:check`, `migrate` → worker up; scheduled jobs; nightly `pg_dump` to Object Storage (7 days) + restore test; Telegram alerts (worker down, backup failed, disk > 80%, token expiry)
+- [ ] H8 — standard setup & operations document; READ.md/PLAN.md refresh; memory update
+
 ## Phase 3 — Analysis foundation
 
 - [ ] Derived daily tables: option chain snapshot per (underlying, expiry, date) — PCR, max pain, OI change, IV (computed locally)
@@ -143,7 +172,7 @@ BSE — SENSEX, BANKEX, BSE Focused IT (BSEFIT).
 - [ ] Real heartbeat: pong timeout + `heartbeat_ts` (Bug #12)
 - [ ] Market calendar: `/v2/market/holidays`, `/v2/market/timings`, WS `market_info`
 - [ ] Telegram alerts: worker death, auth failure, backfill failures, data gaps
-- [ ] Host: Render (paid worker) or VM when available; docker-compose either way
+- [x] Host: Oracle VM via docker compose (Phase H)
 - [ ] Performance: debug-level tick logs (Perf #5) — Perf #1/#2/#3/#4 done in Phase 0
 - [ ] Shard keys across connections and across accounts (5 conn/account on Plus)
 - [ ] Use Upstox `I1` 1m OHLC from full-mode feed if present for F&O; roll up 5m/15m locally
@@ -179,7 +208,7 @@ BSE — SENSEX, BANKEX, BSE Focused IT (BSEFIT).
 
 1. RESOLVED — expiries come from Get Expiries (2024-10 onwards); no earlier option history is available from Upstox
 2. RESOLVED — measured cost is far lower than estimated (NIFTY ≈ 282k rows); Supabase free for now, Oracle VM later
-3. Oracle Free VM — pending user
+3. RESOLVED 2026-09-27 — Oracle Free VM (Mumbai, Ampere A1 4 OCPU / 24 GB) is prod; self-hosted Postgres replaces Supabase
 4. Render free tier has no free background workers (to verify at deploy) — nightly backfill via GitHub Actions until then
 
 ## Verified facts (2026-09-10)

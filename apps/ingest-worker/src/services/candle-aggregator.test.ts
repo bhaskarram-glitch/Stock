@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { CandleAggregator } from "./candle-aggregator.js";
 import { CumulativeVolumeTracker } from "./volume-tracker.js";
+import { fakeDb } from "../test-utils/fake-db.js";
 
 vi.mock("../lib/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -12,44 +13,30 @@ vi.mock("../lib/logger.js", () => ({
 
 type Row = Record<string, unknown>;
 
-function mockSupabase(instrumentIds: Record<string, string>) {
-  const upserts: Row[][] = [];
+function mockDb(instrumentIds: Record<string, string>) {
   let instrumentQueries = 0;
-  const client = {
-    from(table: string) {
-      if (table === "instruments") {
-        return {
-          select: () => ({
-            in: (_col: string, keys: string[]) => {
-              instrumentQueries += 1;
-              return Promise.resolve({
-                data: keys
-                  .filter((k) => instrumentIds[k])
-                  .map((k) => ({
-                    id: instrumentIds[k],
-                    provider_instrument_key: k,
-                  })),
-                error: null,
-              });
-            },
-          }),
-        };
-      }
-      if (table === "market_candles") {
-        return {
-          upsert: (rows: Row[]) => {
-            upserts.push(rows);
-            return Promise.resolve({ error: null });
-          },
-        };
-      }
-      throw new Error(`unexpected table ${table}`);
-    },
-  };
+  const db = fakeDb((text, values) => {
+    if (!text.includes("from instruments")) return [];
+    instrumentQueries += 1;
+    return (values[0] as string[])
+      .filter((k) => instrumentIds[k])
+      .map((k) => ({ id: instrumentIds[k], provider_instrument_key: k }));
+  });
   return {
-    client: client as never,
-    upserts,
-    rows: () => upserts.flat(),
+    client: db,
+    /** one entry per INSERT statement, holding that statement's rows */
+    get upserts(): Row[][] {
+      const per: Row[][] = [];
+      let offset = 0;
+      const all = db.inserted("market_candles");
+      for (const st of db.statements.filter((x) => x.text.startsWith('insert into "market_candles"'))) {
+        const n = st.values.length / 10;
+        per.push(all.slice(offset, offset + n));
+        offset += n;
+      }
+      return per;
+    },
+    rows: () => db.inserted("market_candles"),
     instrumentQueries: () => instrumentQueries,
   };
 }
@@ -59,7 +46,7 @@ const T0 = Date.UTC(2026, 8, 11, 4, 0, 0); // 09:30 IST, on a 1h boundary
 
 function makeAggregator(ids: Record<string, string> = { [KEY]: "uuid-1" }) {
   let clock = T0;
-  const db = mockSupabase(ids);
+  const db = mockDb(ids);
   const agg = new CandleAggregator(db.client, {
     activeIntervals: ["1m"],
     now: () => clock,
@@ -209,7 +196,7 @@ describe("CandleAggregator", () => {
   });
 
   it("aligns 1d buckets to IST midnight", async () => {
-    const db = mockSupabase({ [KEY]: "uuid-1" });
+    const db = mockDb({ [KEY]: "uuid-1" });
     const agg = new CandleAggregator(db.client, {
       activeIntervals: ["1d"],
       now: () => T0,

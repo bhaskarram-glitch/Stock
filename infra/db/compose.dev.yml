@@ -1,0 +1,33 @@
+# infra/db/compose.dev.yml — local Postgres for development (laptop / WSL2). Same version and roles
+# as production, throwaway passwords, data in a Docker volume.
+#
+#   docker compose -f infra/db/compose.dev.yml up -d
+#   cd apps/ingest-worker && npm run db:migrate
+#   docker compose -f infra/db/compose.dev.yml down -v     # wipe and start over
+#
+# apps/ingest-worker/.env for dev:
+#   DATABASE_URL=postgresql://stock_app:dev_app@localhost:5433/stock
+#   MIGRATION_DATABASE_URL=postgresql://stock_migrator:dev_migrator@localhost:5433/stock
+# Port 5433 so it never collides with a prod tunnel or another local Postgres on 5432.
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: stock-pg-dev
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dev_postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata-dev:/var/lib/postgresql/data
+      - ./init-roles.dev.sql:/docker-entrypoint-initdb.d/10-roles.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata-dev:

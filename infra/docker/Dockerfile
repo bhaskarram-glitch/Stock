@@ -2,6 +2,8 @@
 # Build context is the REPO ROOT (needs packages/shared + tsconfig.base.json):
 #   docker build -f infra/docker/Dockerfile -t stock-ingest-worker .
 # Same image runs the streaming worker and the jobs; WORKER_MODE / command select the behaviour.
+# node:22-alpine is multi-arch: building on the Oracle VM / Pi gives arm64, on a laptop amd64.
+# Cross-build if ever needed: docker buildx build --platform linux/arm64,linux/amd64 ...
 
 # ---- build stage -------------------------------------------------------------
 FROM node:22-alpine AS build
@@ -24,6 +26,8 @@ COPY apps/ingest-worker/package.json apps/ingest-worker/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 
 COPY --from=build /repo/apps/ingest-worker/dist ./dist
+# SQL migrations for `jobs/migrate.js` (looks in /app/migrations)
+COPY infra/db/migrations ./migrations
 
 # Non-root, no shell needed
 USER node

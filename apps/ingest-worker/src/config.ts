@@ -26,9 +26,8 @@ export interface UpstoxAccountRegistry {
 
 export type AppConfig = {
   workerMode: WorkerMode;
-  supabaseUrl: string | null;
-  supabaseServiceRoleKey: string | null;
-  hasSupabase: boolean;
+  /** App-role connection string (stock_app). Null when unset; DB modes fail fast with a clear error. */
+  databaseUrl: string | null;
   upstoxBaseUrl: string;
   upstoxAccounts: UpstoxAccountRegistry;
   upstoxInstrumentKeys: string[];
@@ -250,15 +249,11 @@ function buildRegistry(accounts: UpstoxAccount[]): UpstoxAccountRegistry {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
-  const supabaseUrl = readOptional(env, "SUPABASE_URL");
-  const supabaseServiceRoleKey = readOptional(env, "SUPABASE_SERVICE_ROLE_KEY");
   const upstoxAccounts = buildRegistry(readUpstoxAccounts(env));
 
   return {
     workerMode: readWorkerMode(env),
-    supabaseUrl,
-    supabaseServiceRoleKey,
-    hasSupabase: Boolean(supabaseUrl && supabaseServiceRoleKey),
+    databaseUrl: readOptional(env, "DATABASE_URL"),
     upstoxBaseUrl:
       readOptional(env, "UPSTOX_BASE_URL") ?? DEFAULT_UPSTOX_BASE_URL,
     upstoxAccounts,

@@ -2,11 +2,15 @@ import { describe, expect, it } from "vitest";
 import { describeAccount, loadConfig } from "./config.js";
 
 const base = {
-  SUPABASE_URL: "https://x.supabase.co",
-  SUPABASE_SERVICE_ROLE_KEY: "k",
+  DATABASE_URL: "postgresql://stock_app:pw@127.0.0.1:5432/stock",
 };
 
 describe("loadConfig", () => {
+  it("reads DATABASE_URL and treats blank as unset", () => {
+    expect(loadConfig({ ...base }).databaseUrl).toBe(base.DATABASE_URL);
+    expect(loadConfig({ ...base, DATABASE_URL: "  " }).databaseUrl).toBeNull();
+  });
+
   it("defaults to healthcheck and rejects unknown modes", () => {
     expect(loadConfig({ ...base }).workerMode).toBe("healthcheck");
     expect(
