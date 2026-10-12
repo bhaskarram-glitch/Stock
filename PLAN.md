@@ -139,8 +139,8 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
 
 - [x] H1 — VM created (after "out of host capacity" retries via Resource Manager stack), renamed, SSH key login, ₹1 budget alert, Oracle-managed encryption, agent plugins, 150 GB block volume attached
 - [x] H2 — hardening: auto security updates (reboot 02:30 IST), Asia/Kolkata + chrony on Oracle NTP, 2 GB swap, Tailscale (key expiry off, MagicDNS), SSH keys-only/no root, fail2ban, public port 22 closed, weekly boot-volume backup policy (3 kept)
-- [~] H3 — `/data` (ext4, nofail, by UUID); Docker with log caps and `RequiresMountsFor=/data`; Postgres 17 container `stock-pg` on 127.0.0.1:5432 (`/opt/stock-db`); DB `stock`, roles `stock_migrator` + `stock_app`; laptop access via `stockdb` PowerShell shortcut (psql on the server). Pending: password-login test, reboot test
-- [~] H4 — repo off Supabase (2026-10-09):
+- [x] H3 — `/data` (ext4, nofail, by UUID); Docker with log caps and `RequiresMountsFor=/data`; Postgres 17 container `stock-pg` on 127.0.0.1:5432 (`/opt/stock-db`); DB `stock`, roles `stock_migrator` + `stock_app`; laptop access via `stockdb` PowerShell shortcut (psql on the server). Password login + reboot test passed (2026-10-12)
+- [x] H4 — repo off Supabase (2026-10-09; pushed 2026-10-12 as `6f063a7`, 76 passed / 5 skipped):
   - `supabase-js` → `pg`; `src/lib/db.ts` (pool, DATE as string, `upsertRows` with chunking + in-batch dedupe), `src/lib/db-types.ts`
   - `infra/db/migrations/0001_init.sql` — consolidated schema (gen_random_uuid, no RLS, live `provider` enum, redundant indexes dropped)
   - `src/jobs/migrate.ts` (`npm run db:migrate`, `db:status`) — once-only, per-file transaction, advisory lock, checksum guard
@@ -149,9 +149,12 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
   - `infra/db/compose.prod.yml`, `compose.dev.yml`, `init-roles.dev.sql`
   - Deleted: `lib/supabase.ts`, `lib/database.types.ts`, `schema-websocket.sql`
   - Integration test `src/lib/db.integration.test.ts` (runs when `TEST_DATABASE_URL` is set)
-  - [ ] User applies + pushes
 - [ ] H5 — laptop dev: WSL2 Ubuntu + Docker Desktop + Node; `compose.dev.yml`; deferred until needed (decided 2026-10-08: nothing installed on the laptop yet)
-- [ ] H6 — data move: schema-only diff vs live Supabase, `pg_dump --data-only` → restore on VM, row counts + `backfill_state` match, Supabase kept read-only 1 week then retired; delete `infra/supabase/`
+- [~] H6 — data move
+  - [x] Repo cloned to `/opt/stock`; `/opt/stock-db/compose.yml` replaced with `infra/db/compose.prod.yml` (adds `stock-net`); worker `.env` (DB URLs only, 600); image built on arm64; `migrate` applied `0001_init.sql`; healthcheck OK
+  - [x] Live Supabase schema exported (`/data/backups/supabase/supabase_schema.sql`) and compared on Postgres (2026-10-12): all 82 columns, all constraints and all enums used by tables identical to `0001_init.sql`. Live-only leftovers not carried over: unused `market_provider` enum, `update_updated_at_column()` + 2 duplicate updated_at triggers, 5 redundant indexes, RLS policies
+  - [ ] Stop anything writing to Supabase → `pg_dump --data-only` (custom format) → `pg_restore --data-only --disable-triggers --single-transaction` into `stock` → exact row counts match per table, no orphan candles
+  - [ ] Keep Supabase untouched 1 week as fallback, then pause/delete it; delete `infra/supabase/`
 - [ ] H7 — deploy: clone on VM, `.env` 600, `accounts:check`, `migrate` → worker up; scheduled jobs; nightly `pg_dump` to Object Storage (7 days) + restore test; Telegram alerts (worker down, backup failed, disk > 80%, token expiry)
 - [ ] H8 — standard setup & operations document; READ.md/PLAN.md refresh; memory update
 
