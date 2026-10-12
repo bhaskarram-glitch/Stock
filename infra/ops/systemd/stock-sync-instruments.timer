@@ -1,0 +1,10 @@
+# infra/ops/systemd/stock-sync-instruments.timer — installed and enabled by infra/ops/install.sh
+[Unit]
+Description=Pre-market instrument sync
+
+[Timer]
+OnCalendar=Mon..Fri 08:00 Asia/Kolkata
+Persistent=true
+
+[Install]
+WantedBy=timers.target

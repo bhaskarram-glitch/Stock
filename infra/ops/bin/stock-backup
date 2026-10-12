@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# infra/ops/bin/stock-backup — nightly logical backup of the `stock` database.
+#   1. pg_dump (custom format, compressed) → $BACKUP_DIR/stock_<date>_<time>.dump
+#   2. verify the archive can be read and contains the candle data, else fail (→ alert)
+#   3. delete local copies older than BACKUP_KEEP_DAYS
+#   4. if RCLONE_REMOTE is set: upload, then delete remote copies older than REMOTE_KEEP_DAYS
+# Restore: see stock-restore-test (same pg_restore command, into a real database).
+set -euo pipefail
+# shellcheck source=stock-common.sh
+. "$(dirname "$(readlink -f "$0")")/stock-common.sh"
+
+mkdir -p "$BACKUP_DIR"
+out="$BACKUP_DIR/stock_$(date +%F_%H%M).dump"
+tmp="$out.partial"
+trap 'rm -f "$tmp"' EXIT
+
+docker exec "$PG_CONTAINER" pg_dump -U postgres -d stock -Fc -Z 6 >"$tmp"
+
+toc="$(docker exec -i "$PG_CONTAINER" pg_restore --list <"$tmp")"
+if ! grep -q "TABLE DATA public market_candles" <<<"$toc"; then
+  echo "backup archive is unreadable or has no market_candles data: $tmp" >&2
+  exit 1
+fi
+
+chmod 600 "$tmp"
+mv "$tmp" "$out"
+find "$BACKUP_DIR" -maxdepth 1 -name 'stock_*.dump' -type f -mtime +"${BACKUP_KEEP_DAYS:-7}" -delete
+size="$(du -h "$out" | cut -f1)"
+
+if [ -n "${RCLONE_REMOTE:-}" ]; then
+  rclone copyto "$out" "$RCLONE_REMOTE/$(basename "$out")" --retries 3
+  rclone delete "$RCLONE_REMOTE" --min-age "${REMOTE_KEEP_DAYS:-30}d" --include 'stock_*.dump'
+  echo "backup ok: $out ($size), uploaded to $RCLONE_REMOTE"
+else
+  echo "backup ok: $out ($size); RCLONE_REMOTE not set, local copy only"
+fi

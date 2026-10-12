@@ -1,0 +1,10 @@
+# infra/ops/systemd/stock-summary.timer — installed and enabled by infra/ops/install.sh
+[Unit]
+Description=Daily status message
+
+[Timer]
+OnCalendar=*-*-* 21:30 Asia/Kolkata
+Persistent=false
+
+[Install]
+WantedBy=timers.target

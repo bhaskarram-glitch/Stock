@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# infra/ops/bin/stock-job — run one app job from infra/docker/docker-compose.yml to completion.
+#   stock-job check-accounts
+#   stock-job sync-instruments
+#   stock-job backfill all                 # args after the job name go to the job
+#   stock-job backfill options --symbols NIFTY --limit 500
+#   stock-job migrate
+# Exit code = the job's exit code. A second run of the same job while one is active exits 75
+# ("already running") instead of doubling API usage.
+set -euo pipefail
+# shellcheck source=stock-common.sh
+. "$(dirname "$(readlink -f "$0")")/stock-common.sh"
+
+job="${1:?usage: stock-job <job> [args...]}"
+case "$job" in
+  migrate | sync-instruments | backfill | check-accounts) ;;
+  *) echo "unknown job '$job' (migrate | sync-instruments | backfill | check-accounts)" >&2; exit 2 ;;
+esac
+
+mkdir -p "$STOCK_STATE_DIR"
+exec 9>"$STOCK_STATE_DIR/job-$job.lock"
+if ! flock -n 9; then
+  echo "$job is already running; not starting another" >&2
+  exit 75
+fi
+
+cd "$STOCK_DIR"
+docker compose -f "$COMPOSE_FILE" run --rm -T "$@"

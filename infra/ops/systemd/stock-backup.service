@@ -1,0 +1,14 @@
+# infra/ops/systemd/stock-backup.service — installed by infra/ops/install.sh
+[Unit]
+Description=Nightly pg_dump of the stock database
+Wants=docker.service
+After=docker.service network-online.target
+OnFailure=stock-notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=__STOCK_USER__
+ExecStart=/usr/local/bin/stock-backup
+TimeoutStartSec=1h
+Nice=10
+IOSchedulingClass=idle

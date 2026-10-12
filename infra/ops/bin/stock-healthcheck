@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# infra/ops/bin/stock-healthcheck — server health, every 15 min (stock-healthcheck.timer).
+#   Checks: disk usage of / and /data, DB container healthy, newest backup recent enough.
+#   Alerts only when the set of problems CHANGES (no repeat spam), and once when all is OK again.
+# stock-healthcheck --summary — one daily status message (stock-summary.timer). It doubles as a
+#   dead-man's switch: if the evening message stops arriving, alerting itself is broken.
+set -euo pipefail
+here="$(dirname "$(readlink -f "$0")")"
+# shellcheck source=stock-common.sh
+. "$here/stock-common.sh"
+
+problems=()
+
+for mount in / /data; do
+  pct="$( (df --output=pcent "$mount" 2>/dev/null || true) | tail -n 1 | tr -dc '0-9')"
+  if [ -z "$pct" ]; then
+    problems+=("disk $mount: not mounted")
+  elif [ "$pct" -ge "${DISK_ALERT_PCT:-80}" ]; then
+    problems+=("disk $mount at ${pct}%")
+  fi
+done
+
+pg_health="$(docker inspect -f '{{.State.Health.Status}}' "$PG_CONTAINER" 2>/dev/null || echo missing)"
+[ "$pg_health" = "healthy" ] || problems+=("database container $PG_CONTAINER is $pg_health")
+
+backup="$(latest_backup)"
+if [ -z "$backup" ]; then
+  problems+=("no backup found in $BACKUP_DIR")
+else
+  age_h=$((($(date +%s) - $(stat -c %Y "$backup")) / 3600))
+  [ "$age_h" -lt "${BACKUP_MAX_AGE_HOURS:-26}" ] || problems+=("newest backup is ${age_h}h old")
+fi
+
+if [ "${1:-}" = "--summary" ]; then
+  if [ "$pg_health" = "healthy" ]; then
+    db="$(pg_sql "select 'db ' || pg_size_pretty(pg_database_size('stock'))
+      || ' · candles ' || (select count(*) from market_candles)
+      || ' · backfill errors ' || (select count(*) from backfill_state where last_error is not null)
+      || ' · last backfill ' || coalesce(to_char(max(last_run_at) at time zone 'Asia/Kolkata', 'DD Mon HH24:MI'), 'never')
+      from backfill_state")"
+  else
+    db="db unavailable"
+  fi
+  disk="$( (df -h --output=target,pcent / /data 2>/dev/null || true) | tail -n +2 | awk '{printf "%s %s  ", $1, $2}')"
+  status="OK"
+  [ ${#problems[@]} -eq 0 ] || status="PROBLEMS: $(printf '%s; ' "${problems[@]}")"
+  "$here/stock-notify" "📊 Daily status: $status
+$db
+disk: $disk
+last backup: $(basename "${backup:-none}")"
+  exit 0
+fi
+
+mkdir -p "$STOCK_STATE_DIR"
+state_file="$STOCK_STATE_DIR/health.last"
+current="$(printf '%s\n' "${problems[@]+"${problems[@]}"}")"
+previous="$(cat "$state_file" 2>/dev/null || true)"
+
+if [ "$current" != "$previous" ]; then
+  if [ ${#problems[@]} -eq 0 ]; then
+    "$here/stock-notify" "✅ Server healthy again"
+  else
+    "$here/stock-notify" "⚠️ Server health:
+$current"
+  fi
+  printf '%s' "$current" >"$state_file"
+fi
+
+if [ ${#problems[@]} -eq 0 ]; then
+  echo "healthy"
+else
+  printf 'problem: %s\n' "${problems[@]}"
+fi

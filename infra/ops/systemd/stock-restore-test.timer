@@ -1,0 +1,10 @@
+# infra/ops/systemd/stock-restore-test.timer — installed and enabled by infra/ops/install.sh
+[Unit]
+Description=Monthly restore test (first Sunday)
+
+[Timer]
+OnCalendar=Sun *-*-01..07 04:00 Asia/Kolkata
+Persistent=false
+
+[Install]
+WantedBy=timers.target

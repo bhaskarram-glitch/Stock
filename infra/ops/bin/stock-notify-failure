@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# infra/ops/bin/stock-notify-failure — called by stock-notify-failure@.service (OnFailure= of every
+# stock-* unit). Sends the failed unit's name and the tail of its log to Telegram.
+set -euo pipefail
+unit="${1:?usage: stock-notify-failure <unit>}"
+log="$(journalctl -u "$unit" -n 15 --no-pager -o cat 2>/dev/null | tail -c 3000 || true)"
+exec "$(dirname "$(readlink -f "$0")")/stock-notify" "❌ $unit failed
+$log
+Details: journalctl -u $unit -n 100"

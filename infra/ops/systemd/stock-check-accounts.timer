@@ -1,0 +1,10 @@
+# infra/ops/systemd/stock-check-accounts.timer — installed and enabled by infra/ops/install.sh
+[Unit]
+Description=Pre-market Upstox token check
+
+[Timer]
+OnCalendar=Mon..Fri 07:30 Asia/Kolkata
+Persistent=false
+
+[Install]
+WantedBy=timers.target

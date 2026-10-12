@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# infra/ops/bin/stock-notify — send a Telegram message: stock-notify "text"
+# No-op (exit 0, message goes to stderr/journal) when Telegram isn't configured, so a missing
+# bot never breaks the job that called it.
+set -euo pipefail
+# shellcheck source=stock-common.sh
+. "$(dirname "$(readlink -f "$0")")/stock-common.sh"
+
+msg="[$(hostname)] $*"
+if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+  echo "telegram not configured; would send: $msg" >&2
+  exit 0
+fi
+
+# Token goes through a curl config on stdin, not argv, so it never shows up in `ps`.
+curl -fsS --max-time 20 --retry 2 -o /dev/null -K - \
+  --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+  --data-urlencode "text=${msg:0:4000}" <<EOF
+url = "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+EOF

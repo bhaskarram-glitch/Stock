@@ -1,0 +1,10 @@
+# infra/ops/systemd/stock-backup.timer — installed and enabled by infra/ops/install.sh
+[Unit]
+Description=Nightly database backup (before the 02:30 update-reboot window)
+
+[Timer]
+OnCalendar=*-*-* 01:30 Asia/Kolkata
+Persistent=true
+
+[Install]
+WantedBy=timers.target

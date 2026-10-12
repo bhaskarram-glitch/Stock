@@ -1,0 +1,12 @@
+# infra/ops/systemd/stock-healthcheck.service — installed by infra/ops/install.sh
+[Unit]
+Description=Disk, database and backup-age check
+Wants=docker.service
+After=docker.service network-online.target
+OnFailure=stock-notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=__STOCK_USER__
+ExecStart=/usr/local/bin/stock-healthcheck
+TimeoutStartSec=5min

@@ -150,12 +150,21 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
   - Deleted: `lib/supabase.ts`, `lib/database.types.ts`, `schema-websocket.sql`
   - Integration test `src/lib/db.integration.test.ts` (runs when `TEST_DATABASE_URL` is set)
 - [ ] H5 — laptop dev: WSL2 Ubuntu + Docker Desktop + Node; `compose.dev.yml`; deferred until needed (decided 2026-10-08: nothing installed on the laptop yet)
-- [~] H6 — data move
+- [x] H6 — data move (2026-10-12)
   - [x] Repo cloned to `/opt/stock`; `/opt/stock-db/compose.yml` replaced with `infra/db/compose.prod.yml` (adds `stock-net`); worker `.env` (DB URLs only, 600); image built on arm64; `migrate` applied `0001_init.sql`; healthcheck OK
   - [x] Live Supabase schema exported (`/data/backups/supabase/supabase_schema.sql`) and compared on Postgres (2026-10-12): all 82 columns, all constraints and all enums used by tables identical to `0001_init.sql`. Live-only leftovers not carried over: unused `market_provider` enum, `update_updated_at_column()` + 2 duplicate updated_at triggers, 5 redundant indexes, RLS policies
-  - [ ] Stop anything writing to Supabase → `pg_dump --data-only` (custom format) → `pg_restore --data-only --disable-triggers --single-transaction` into `stock` → exact row counts match per table, no orphan candles
-  - [ ] Keep Supabase untouched 1 week as fallback, then pause/delete it; delete `infra/supabase/`
-- [ ] H7 — deploy: clone on VM, `.env` 600, `accounts:check`, `migrate` → worker up; scheduled jobs; nightly `pg_dump` to Object Storage (7 days) + restore test; Telegram alerts (worker down, backup failed, disk > 80%, token expiry)
+  - [x] `pg_dump --data-only` (13 MB, `/data/backups/supabase/supabase_data.dump`) → `pg_restore --single-transaction` into `stock`; exact counts match on all 8 tables (instruments 214,316 · market_candles 57,725 · backfill_state 3,068 · underlying_expiries 159 · instrument_status 3); 0 orphan candles; DB 116 MB
+  - [ ] Keep Supabase untouched until 2026-10-19 as fallback, then pause/delete it; delete `infra/supabase/` and both dump files
+- [~] H7 — scheduled operation (code delivered 2026-10-12)
+  - Fix: backfill watermark = date of the newest candle received, not "today" (a run before Upstox published today's candle skipped that day forever); contracts final only after expiry day; `0002_fix_backfill_watermarks.sql` repairs existing rows; backfill job importable for tests (+ `backfill-history.test.ts`)
+  - `infra/ops/` — `install.sh` (idempotent, `STOCK_USER` for a Pi), `stock.env.example` → `/etc/stock/stock.env`, `bin/` scripts → `/usr/local/bin`, `systemd/` units
+  - Schedule (IST): `check-accounts` Mon–Fri 07:30 · `sync-instruments` Mon–Fri 08:00 · `backfill all` Mon–Fri 19:30 · `backup` daily 01:30 · health check every 15 min · status message daily 21:30 · restore test first Sunday 04:00
+  - Any failed job → Telegram with the log tail (`stock-notify-failure@`); health alerts only on change; daily status doubles as a dead-man's switch; same job can't run twice at once (`flock`)
+  - Backups: `pg_dump -Fc` verified readable, 7 days local in `/data/backups/daily`; off-server copy via rclone when `RCLONE_REMOTE` set (H7 part 2)
+  - Updates: `stock-deploy` (fast-forward, build, migrate, restart worker if running)
+  - [ ] User: apply patch, push, `stock-deploy`, Upstox tokens in `.env`, `check-accounts` green, Telegram bot, `install.sh`, first backup + restore test
+  - [ ] Part 2: Object Storage bucket + instance-principal rclone remote
+  - Streaming worker NOT started: needs Phase 4 first (market calendar, reconnect exhaustion, heartbeat)
 - [ ] H8 — standard setup & operations document; READ.md/PLAN.md refresh; memory update
 
 ## Phase 3 — Analysis foundation

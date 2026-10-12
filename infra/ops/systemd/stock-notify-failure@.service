@@ -1,0 +1,9 @@
+# infra/ops/systemd/stock-notify-failure@.service — OnFailure handler for every stock-* unit.
+# Runs as root so it can read any unit's journal. %i = the failed unit's name.
+[Unit]
+Description=Telegram alert for failed unit %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/stock-notify-failure %i
+TimeoutStartSec=2min

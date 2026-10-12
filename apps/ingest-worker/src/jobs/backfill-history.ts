@@ -71,6 +71,22 @@ function addDays(date: string, days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * IST trading date of the newest candle, or null when there are none. This — not "today" — is the
+ * watermark: a run before Upstox publishes today's daily candle (market hours, or shortly after
+ * close) must not record today as loaded, or that day is skipped forever.
+ */
+export function lastCandleDate(candles: HistoricalCandle[]): string | null {
+  let latest: string | null = null;
+  for (const c of candles) {
+    const d = toDailyBucketStart(c.ts);
+    if (latest === null || d > latest) latest = d;
+  }
+  return latest === null
+    ? null
+    : new Date(new Date(latest).getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
 /** Upstox stamps daily candles at 09:15 IST; normalise to IST midnight (the 1d bucket start). */
 function toDailyBucketStart(ts: string): string {
   const date = new Date(ts);
@@ -264,7 +280,7 @@ async function backfillSpot(
       );
       await saveState(db, u.instrumentKey, {
         first_date: state?.first_date ?? args.from,
-        last_date: today,
+        last_date: lastCandleDate(candles) ?? state?.last_date ?? null,
         rows_written: (state?.rows_written ?? 0) + written,
         last_error: null,
       });
@@ -477,10 +493,14 @@ async function backfillContracts(
           );
           rows += written;
           loaded += 1;
+          // Final only once the expiry day is over; on/before it, more candles can still arrive.
+          const final = c.expiry < todayIst();
           await saveState(db, c.instrument_key, {
             first_date: state?.first_date ?? args.from,
-            last_date: c.expiry,
-            is_final: true, // contract is expired and now loaded through expiry
+            last_date: final
+              ? c.expiry
+              : (lastCandleDate(candles) ?? state?.last_date ?? null),
+            is_final: final,
             rows_written: (state?.rows_written ?? 0) + written,
             last_error: null,
           });
@@ -628,12 +648,15 @@ async function main(): Promise<void> {
   });
 }
 
-main()
-  .then(() => closeDb())
-  .catch(async (error) => {
-    logger.error("Backfill failed", {
-      error: error instanceof Error ? error.message : String(error),
+// Entry point when run directly (npm run backfill / the compose job); importing for tests runs nothing.
+if (process.argv[1] && /backfill-history\.(ts|js)$/.test(process.argv[1])) {
+  main()
+    .then(() => closeDb())
+    .catch(async (error) => {
+      logger.error("Backfill failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await closeDb().catch(() => undefined);
+      process.exit(1);
     });
-    await closeDb().catch(() => undefined);
-    process.exit(1);
-  });
+}

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# infra/ops/bin/stock-restore-test — proves the newest backup actually restores.
+# Restores it into a scratch database `stock_restore_test` (never touches `stock`), checks the
+# migration history matches live and candles are present, reports counts, then drops the scratch DB.
+# Runs monthly from stock-restore-test.timer; run by hand any time: stock-restore-test [file.dump]
+set -euo pipefail
+# shellcheck source=stock-common.sh
+. "$(dirname "$(readlink -f "$0")")/stock-common.sh"
+
+file="${1:-$(latest_backup)}"
+[ -n "$file" ] && [ -f "$file" ] || { echo "no backup file found in $BACKUP_DIR" >&2; exit 1; }
+
+scratch=stock_restore_test
+cleanup() { pg_sql "drop database if exists $scratch" postgres >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+cleanup
+pg_sql "create database $scratch" postgres
+docker exec -i "$PG_CONTAINER" pg_restore -U postgres -d "$scratch" --no-owner --exit-on-error <"$file"
+
+live_migrations="$(pg_sql "select string_agg(version, ',' order by version) from schema_migrations")"
+test_migrations="$(pg_sql "select string_agg(version, ',' order by version) from schema_migrations" "$scratch")"
+if [ "$live_migrations" != "$test_migrations" ]; then
+  echo "restored migrations ($test_migrations) differ from live ($live_migrations)" >&2
+  exit 1
+fi
+
+counts="$(pg_sql "select 'instruments=' || (select count(*) from instruments)
+  || ' candles=' || (select count(*) from market_candles)
+  || ' backfill_state=' || (select count(*) from backfill_state)" "$scratch")"
+candles="$(pg_sql "select count(*) from market_candles" "$scratch")"
+if [ "$candles" -eq 0 ]; then
+  echo "restored database has no candles" >&2
+  exit 1
+fi
+
+echo "restore test ok: $(basename "$file") → $counts"
+"$(dirname "$(readlink -f "$0")")/stock-notify" "✅ Monthly restore test passed: $(basename "$file") ($counts)"

@@ -1,0 +1,12 @@
+# infra/ops/systemd/stock-backfill.service — installed by infra/ops/install.sh
+[Unit]
+Description=Incremental daily candle backfill (spot, futures, options)
+Wants=docker.service
+After=docker.service network-online.target
+OnFailure=stock-notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=__STOCK_USER__
+ExecStart=/usr/local/bin/stock-job backfill all
+TimeoutStartSec=infinity
