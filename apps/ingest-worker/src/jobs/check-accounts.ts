@@ -3,8 +3,10 @@
  *
  * Run: npm run accounts:check
  *
- * For each account: one cheap historical-candle call (NIFTY spot, one day). Upstox Plus is then
- * checked on the first hist account via one expired-expiries call. Costs ~N+1 requests in total.
+ * For each account: one cheap historical-candle call (NIFTY spot, one day), then — for every
+ * account with the `hist` role — one expired-expiries call, which only succeeds with Upstox Plus.
+ * The backfill spreads expired-contract calls across all hist accounts, so every one must have Plus.
+ * Also flags a mismatch with the UPSTOX_ACCOUNT_<n>_PLUS setting. Costs ~2N requests in total.
  * Tokens are never printed — only alias, roles and a 6-char fingerprint.
  *
  * Exit codes: 0 all accounts OK · 1 at least one account failed · 2 no accounts configured
@@ -51,7 +53,6 @@ async function main(): Promise<void> {
 
   const day = lastWeekday();
   let failures = 0;
-  let firstHistOk: UpstoxHistoricalClient | null = null;
 
   for (const account of accounts) {
     const client = new UpstoxHistoricalClient(account.token, {
@@ -71,29 +72,32 @@ async function main(): Promise<void> {
         probeDay: day,
         candles: candles.length,
       });
-      if (!firstHistOk && account.roles.includes("hist")) firstHistOk = client;
     } catch (error) {
       failures += 1;
       logger.error("ACCOUNT FAIL", {
         ...describeAccount(account),
         reason: reason(error),
       });
+      continue; // token itself is broken; a Plus check would only repeat the error
     }
-  }
 
-  // Plus is required for expired-contract history; check it once on a working hist account.
-  if (firstHistOk) {
+    // Expired-contract history needs Upstox Plus, and the backfill uses every hist account for it.
+    if (!account.roles.includes("hist")) continue;
     try {
-      const expiries = await firstHistOk.getExpiries(PROBE_KEY);
-      logger.info("PLUS OK", {
-        account: firstHistOk.alias,
-        expiries: expiries.length,
-      });
+      const expiries = await client.getExpiries(PROBE_KEY);
+      logger.info("PLUS OK", { account: account.alias, expiries: expiries.length });
+      if (!account.plus) {
+        logger.warn("PLUS setting mismatch", {
+          account: account.alias,
+          hint: "Plus works on this account; set its _PLUS=true in .env",
+        });
+      }
     } catch (error) {
       failures += 1;
       logger.error("PLUS FAIL", {
-        account: firstHistOk.alias,
+        account: account.alias,
         reason: reason(error),
+        hint: "Activate Upstox Plus on this account, or remove `hist` from its _ROLES",
       });
     }
   }
