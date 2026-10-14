@@ -52,6 +52,8 @@ export interface CandleInsert {
   close: number;
   volume?: number | null;
   oi?: number | null;
+  /** Provider's original close when `close` was corrected (migration 0003); null = as reported. */
+  close_reported?: number | null;
   source?: DataSource;
   [column: string]: unknown;
 }

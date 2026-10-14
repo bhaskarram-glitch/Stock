@@ -87,6 +87,33 @@ export function lastCandleDate(candles: HistoricalCandle[]): string | null {
     : new Date(new Date(latest).getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
 }
 
+/**
+ * BSE options, expiry day: Upstox/BSE report the UNDERLYING's final settlement value (e.g. SENSEX
+ * 75,398) in the option's `close` instead of the option's price (verified 2026-10-14: 12,782 rows,
+ * all BSE CE/PE on their own expiry day, close within 1% of the index close). The option settles
+ * at intrinsic value against exactly that number, so the true close is computable from the row:
+ *   CE: max(0, S − strike)   PE: max(0, strike − S)   where S = the reported close.
+ * Applied only when the row is unambiguously wrong — BSE option, expiry day, close above the day's
+ * high, and close at an index-like level (0.5×–2× strike). Everything else passes through untouched.
+ * Returns the close to store and, when replaced, the provider's original value (`close_reported`).
+ * Mirrored for existing rows by infra/db/migrations/0003_bse_expiry_settlement.sql — keep in sync.
+ */
+export function settleBseExpiryClose(
+  candle: HistoricalCandle,
+  contract: Pick<ExpiredContract, "segment" | "instrument_type" | "strike_price" | "expiry">,
+): { close: number; closeReported: number | null } {
+  const strike = contract.strike_price;
+  const type = contract.instrument_type;
+  const asIs = { close: candle.close, closeReported: null };
+  if (contract.segment !== "BSE_FO" || (type !== "CE" && type !== "PE")) return asIs;
+  if (typeof strike !== "number" || !(strike > 0)) return asIs;
+  if (lastCandleDate([candle]) !== contract.expiry) return asIs;
+  const s = candle.close;
+  if (!(s > candle.high) || s < strike * 0.5 || s > strike * 2) return asIs;
+  const intrinsic = type === "CE" ? Math.max(0, s - strike) : Math.max(0, strike - s);
+  return { close: Math.round(intrinsic * 100) / 100, closeReported: s };
+}
+
 /** Upstox stamps daily candles at 09:15 IST; normalise to IST midnight (the 1d bucket start). */
 function toDailyBucketStart(ts: string): string {
   const date = new Date(ts);
@@ -170,21 +197,29 @@ async function writeCandles(
   instrumentKey: string,
   candles: HistoricalCandle[],
   source: "hist" | "hist_expired",
+  contract?: ExpiredContract,
 ): Promise<number> {
   if (candles.length === 0) return 0;
-  const rows: CandleRow[] = candles.map((c) => ({
-    instrument_id: instrumentId,
-    instrument_key: instrumentKey,
-    interval: "1d",
-    bucket_start: toDailyBucketStart(c.ts),
-    open: c.open,
-    high: c.high,
-    low: c.low,
-    close: c.close,
-    volume: c.volume,
-    oi: c.oi,
-    source,
-  }));
+  const rows: CandleRow[] = candles.map((c) => {
+    const { close, closeReported } = contract
+      ? settleBseExpiryClose(c, contract)
+      : { close: c.close, closeReported: null };
+    return {
+      instrument_id: instrumentId,
+      instrument_key: instrumentKey,
+      interval: "1d",
+      bucket_start: toDailyBucketStart(c.ts),
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close,
+      // always sent (null when untouched) so a re-fetch also clears an old correction
+      close_reported: closeReported,
+      volume: c.volume,
+      oi: c.oi,
+      source,
+    };
+  });
 
   let written = 0;
   for (let i = 0; i < rows.length; i += CANDLE_BATCH) {
@@ -490,6 +525,7 @@ async function backfillContracts(
             c.instrument_key,
             candles,
             "hist_expired",
+            c,
           );
           rows += written;
           loaded += 1;

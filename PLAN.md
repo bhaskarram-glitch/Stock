@@ -162,9 +162,12 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
   - Any failed job → Telegram with the log tail (`stock-notify-failure@`); health alerts only on change; daily status doubles as a dead-man's switch; same job can't run twice at once (`flock`)
   - Backups: `pg_dump -Fc` verified readable, 7 days local in `/data/backups/daily`; off-server copy via rclone when `RCLONE_REMOTE` set (H7 part 2)
   - Updates: `stock-deploy` (fast-forward, build, migrate, restart worker if running)
-  - [ ] User: apply patch, push, `stock-deploy`, Upstox tokens in `.env`, `check-accounts` green, Telegram bot, `install.sh`, first backup + restore test
+  - [x] Deployed 2026-10-13: patch pushed (`e631e6f`), `install.sh` run, 5 Upstox accounts in server `.env`, `check-accounts` green (Plus now verified on every hist account, `219f89b`), Telegram alerts working, first backup + restore test passed
+  - [x] Clean refetch 2026-10-13/14: all market data wiped (schema kept) and re-fetched with the fixed code — 693 min, 106,857 contracts, 1,218,656 candles (spot 4,225 · expired contracts 1,214,431), 0 errors, all 369 expiries fully loaded, DB 534 MB
+  - [x] Data QA 2026-10-14: 12,782 BSE option candles on their own expiry day carried the INDEX level as `close` (source data error). Fixed: `close` = settlement value (CE max(0, S−K), PE max(0, K−S), S = reported value), original kept in new `market_candles.close_reported` — `0003_bse_expiry_settlement.sql` for existing rows, `settleBseExpiryClose()` in `backfill-history.ts` for new ones. NSE options and all futures unaffected
   - [ ] Part 2: Object Storage bucket + instance-principal rclone remote
   - Streaming worker NOT started: needs Phase 4 first (market calendar, reconnect exhaustion, heartbeat)
+- [ ] Data gaps found 2026-10-14 (before Phase 3): history for still-active contracts (only expired ones are fetched today); spot for all NSE/BSE indices (only the 9 F&O indices today); progress log line during rate-limit waits
 - [ ] H8 — standard setup & operations document; READ.md/PLAN.md refresh; memory update
 
 ## Phase 3 — Analysis foundation
