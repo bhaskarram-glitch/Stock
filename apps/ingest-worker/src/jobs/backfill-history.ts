@@ -2,7 +2,12 @@
  * Job: backfill daily OHLC history into `market_candles`.
  *
  * Run: npm run backfill -- <target> [options]
- *   target: spot | options | futures | all
+ *   target: spot | options | futures | active | all
+ *     spot     daily candles for every NSE/BSE index (only the --symbols ones when given)
+ *     futures  expired index futures (expired-instruments API, needs Upstox Plus)
+ *     options  expired index options (expired-instruments API, needs Upstox Plus)
+ *     active   still-trading index futures + options (Historical V3)
+ *     all      spot → futures → options → active
  *   --symbols NIFTY,SENSEX   limit to these underlyings (default: all 9 F&O indices)
  *   --from 2024-10-03        earliest date to request (default: HISTORY_FLOOR)
  *   --limit 500              max instruments to process this run (default: unlimited)
@@ -15,6 +20,12 @@
  *     run next week fetches only the days since.
  *   - `underlying_expiries` remembers which expiries have had their contracts enumerated, so
  *     contract listing isn't repeated either.
+ *
+ * One key per contract, for life: Upstox names a trading contract `NSE_FO|47983` and the same
+ * contract after expiry `NSE_FO|47983|17-04-2025`. All contract candles and watermarks use the
+ * expired-style key from day one (`canonicalContractKey`), so history fetched while it trades
+ * (target `active`) and after it expires (targets `options`/`futures`) is one continuous series,
+ * and the expired run simply resumes from the active run's watermark.
  *
  * Daily candles are stored at IST midnight to match the live aggregator's 1d buckets; Upstox
  * returns them stamped at the 09:15 IST open.
@@ -47,9 +58,9 @@ const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 const CANDLE_BATCH = 500;
 const MAX_RETRIES = 3;
 
-type Target = "spot" | "options" | "futures" | "all";
+type Target = "spot" | "options" | "futures" | "active" | "all";
 
-interface Args {
+export interface BackfillArgs {
   target: Target;
   symbols: string[] | null;
   from: string;
@@ -88,6 +99,17 @@ export function lastCandleDate(candles: HistoricalCandle[]): string | null {
 }
 
 /**
+ * The permanent key for a derivative contract: `<segment>|<exchange_token>|<DD-MM-YYYY expiry>`,
+ * i.e. the key Upstox uses once the contract has expired. Verified 2026-10-14 against every row:
+ * trading key = `<segment>|<exchange_token>` (42,776/42,776), expired key = this (107,288/107,288).
+ */
+export function canonicalContractKey(segment: string, exchangeToken: string, expiry: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expiry);
+  if (!m) throw new Error(`Bad expiry date "${expiry}" (want YYYY-MM-DD)`);
+  return `${segment}|${exchangeToken}|${m[3]}-${m[2]}-${m[1]}`;
+}
+
+/**
  * BSE options, expiry day: Upstox/BSE report the UNDERLYING's final settlement value (e.g. SENSEX
  * 75,398) in the option's `close` instead of the option's price (verified 2026-10-14: 12,782 rows,
  * all BSE CE/PE on their own expiry day, close within 1% of the index close). The option settles
@@ -98,9 +120,11 @@ export function lastCandleDate(candles: HistoricalCandle[]): string | null {
  * Returns the close to store and, when replaced, the provider's original value (`close_reported`).
  * Mirrored for existing rows by infra/db/migrations/0003_bse_expiry_settlement.sql — keep in sync.
  */
+type SettleContract = Pick<ExpiredContract, "segment" | "instrument_type" | "strike_price" | "expiry">;
+
 export function settleBseExpiryClose(
   candle: HistoricalCandle,
-  contract: Pick<ExpiredContract, "segment" | "instrument_type" | "strike_price" | "expiry">,
+  contract: SettleContract,
 ): { close: number; closeReported: number | null } {
   const strike = contract.strike_price;
   const type = contract.instrument_type;
@@ -197,7 +221,7 @@ async function writeCandles(
   instrumentKey: string,
   candles: HistoricalCandle[],
   source: "hist" | "hist_expired",
-  contract?: ExpiredContract,
+  contract?: SettleContract,
 ): Promise<number> {
   if (candles.length === 0) return 0;
   const rows: CandleRow[] = candles.map((c) => {
@@ -276,11 +300,18 @@ async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
 // ---------------------------------------------------------------------------
 
 /** Index spot daily candles for the resolved underlyings. */
+interface SpotTarget {
+  symbol: string;
+  instrumentKey: string;
+  instrumentId: string;
+}
+
+/** Index spot daily candles (every NSE/BSE index, or just the --symbols underlyings). */
 async function backfillSpot(
   db: Db,
   pool: UpstoxHistoricalClientPool,
-  underlyings: ResolvedUnderlying[],
-  args: Args,
+  underlyings: SpotTarget[],
+  args: BackfillArgs,
 ): Promise<void> {
   const today = todayIst();
   const states = await loadStates(
@@ -413,7 +444,7 @@ async function backfillContracts(
   pool: UpstoxHistoricalClientPool,
   underlyings: ResolvedUnderlying[],
   kind: "options" | "futures",
-  args: Args,
+  args: BackfillArgs,
 ): Promise<void> {
   let processed = 0;
 
@@ -591,15 +622,171 @@ async function backfillContracts(
   }
 }
 
+/** A still-trading index contract as synced from the Upstox instrument master. */
+interface ActiveContractRow {
+  provider_instrument_key: string;
+  exchange: string;
+  segment: string;
+  trading_symbol: string;
+  name: string;
+  instrument_type: string | null;
+  exchange_token: string;
+  tick_size: string | null; // numeric → string from pg
+  lot_size: number | null;
+  underlying_key: string;
+  underlying_symbol: string | null;
+  expiry: string;
+  strike: string | null;
+  option_type: string | null;
+  weekly: boolean | null;
+  metadata: Json | null;
+}
+
+const ACTIVE_PROGRESS_EVERY = 500;
+
+/**
+ * Still-trading futures + options of the resolved underlyings: daily candles via Historical V3,
+ * stored under the contract's permanent (expired-style) key. Never marks anything final — once the
+ * contract expires, the options/futures targets take over from the same watermark.
+ */
+export async function backfillActive(
+  db: Db,
+  pool: UpstoxHistoricalClientPool,
+  underlyings: ResolvedUnderlying[],
+  args: BackfillArgs,
+): Promise<void> {
+  const today = todayIst();
+  const { rows: contracts } = await db.query<ActiveContractRow>(
+    `select provider_instrument_key, exchange, segment, trading_symbol, name, instrument_type,
+            exchange_token, tick_size, lot_size, underlying_key, underlying_symbol, expiry, strike,
+            option_type, weekly, metadata
+       from instruments
+      where segment in ('NSE_FO', 'BSE_FO')
+        and expiry >= $1::date
+        and provider_instrument_key = segment || '|' || exchange_token
+        and underlying_key = any($2::text[])
+      order by expiry, underlying_key, option_type nulls first, strike`,
+    [today, underlyings.map((u) => u.instrumentKey)],
+  );
+  const work = contracts.map((r) => ({
+    row: r,
+    key: canonicalContractKey(r.segment, r.exchange_token, r.expiry),
+  }));
+  logger.info("Active contracts", {
+    contracts: work.length,
+    byUnderlying: Object.fromEntries(
+      underlyings.map((u) => [u.symbol, contracts.filter((c) => c.underlying_key === u.instrumentKey).length]),
+    ),
+  });
+  if (work.length === 0 || args.dryRun) return;
+
+  // Create the permanent-key instrument rows that don't exist yet. DO NOTHING on conflict: a row
+  // the expired run already wrote (contract expiring today) must not be flipped back to active.
+  await upsertRows(
+    db,
+    "instruments",
+    work.map(({ row: r, key }) => ({
+      provider: "upstox",
+      provider_instrument_key: key,
+      exchange: r.exchange,
+      segment: r.segment,
+      trading_symbol: r.trading_symbol,
+      name: r.name,
+      isin: null,
+      instrument_type: r.instrument_type,
+      exchange_token: r.exchange_token,
+      tick_size: r.tick_size === null ? null : Number(r.tick_size),
+      lot_size: r.lot_size,
+      underlying_key: r.underlying_key,
+      underlying_symbol: r.underlying_symbol,
+      expiry: r.expiry,
+      strike: r.strike === null ? null : Number(r.strike),
+      option_type: r.option_type,
+      weekly: r.weekly,
+      is_expired: false,
+      is_active: true,
+      metadata: <Json>{ trading_key: r.provider_instrument_key },
+    })),
+    { conflict: ["provider", "provider_instrument_key"], ignoreDuplicates: true },
+  );
+  const idByKey = new Map<string, string>();
+  for (let i = 0; i < work.length; i += 1000) {
+    const { rows } = await db.query<{ id: string; provider_instrument_key: string }>(
+      `select id, provider_instrument_key from instruments
+        where provider = 'upstox' and provider_instrument_key = any($1::text[])`,
+      [work.slice(i, i + 1000).map((w) => w.key)],
+    );
+    for (const r of rows) idByKey.set(r.provider_instrument_key, r.id);
+  }
+  const states = await loadStates(db, work.map((w) => w.key));
+
+  let processed = 0;
+  let fetched = 0;
+  let skipped = 0;
+  let failed = 0;
+  let rowsWritten = 0;
+  for (const { row: r, key } of work) {
+    if (args.limit && processed >= args.limit) {
+      logger.info("Reached --limit, stopping", { processed });
+      break;
+    }
+    processed += 1;
+    const state = states.get(key);
+    const from = state?.last_date ? addDays(state.last_date, 1) : args.from;
+    const instrumentId = idByKey.get(key);
+    if (state?.is_final || from > today || !instrumentId) {
+      if (!instrumentId) logger.error("Active contract missing after upsert", { key });
+      skipped += 1;
+      continue;
+    }
+    try {
+      const candles = await withRetry(`active ${r.trading_symbol}`, () =>
+        pool.getHistoricalCandles(r.provider_instrument_key, "days", 1, from, today),
+      );
+      const written = await writeCandles(db, instrumentId, key, candles, "hist", {
+        segment: r.segment,
+        instrument_type: r.option_type ?? r.instrument_type ?? "",
+        strike_price: r.strike === null ? undefined : Number(r.strike),
+        expiry: r.expiry,
+      });
+      rowsWritten += written;
+      fetched += 1;
+      await saveState(db, key, {
+        first_date: state?.first_date ?? args.from,
+        last_date: lastCandleDate(candles) ?? state?.last_date ?? null,
+        rows_written: (state?.rows_written ?? 0) + written,
+        last_error: null,
+      });
+    } catch (error) {
+      failed += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      await saveState(db, key, { last_error: message });
+      logger.error("Active contract candles failed", { key, trading: r.provider_instrument_key, error: message });
+    }
+    if (processed % ACTIVE_PROGRESS_EVERY === 0) {
+      logger.info("Active progress", {
+        processed,
+        total: work.length,
+        fetched,
+        skipped,
+        failed,
+        rows: rowsWritten,
+        candleUsage30m: `${pool.usage("historical-candles").lastThirtyMinutes}/${pool.usage("historical-candles").budgetThirtyMinutes}`,
+      });
+    }
+  }
+  logger.info("Active contracts done", { processed, fetched, skipped, failed, rows: rowsWritten });
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-function parseArgs(argv: string[]): Args {
+function parseArgs(argv: string[]): BackfillArgs {
   const target = (argv[0] ?? "all") as Target;
-  if (!["spot", "options", "futures", "all"].includes(target)) {
+  if (!["spot", "options", "futures", "active", "all"].includes(target)) {
     throw new Error(
-      `Unknown target "${target}". Use: spot | options | futures | all`,
+      `Unknown target "${target}". Use: spot | options | futures | active | all`,
     );
   }
   const flag = (name: string): string | undefined => {
@@ -668,15 +855,27 @@ async function main(): Promise<void> {
     accounts: pool.aliases(),
     candleRequestsPerHour: pool.size * 1800, // 90% of 2000/h/account
     underlyings: resolved.map((u) => `${u.symbol}=${u.instrumentKey}`),
+    spotIndices: args.symbols ? resolved.length : indexRows.length,
   });
+
+  // Spot: every index in the instrument master, or only the requested underlyings.
+  const spotTargets: SpotTarget[] = args.symbols
+    ? resolved
+    : indexRows.map((r) => ({
+        symbol: r.trading_symbol,
+        instrumentKey: r.provider_instrument_key,
+        instrumentId: r.id,
+      }));
 
   const started = Date.now();
   if (args.target === "spot" || args.target === "all")
-    await backfillSpot(db, pool, resolved, args);
+    await backfillSpot(db, pool, spotTargets, args);
   if (args.target === "futures" || args.target === "all")
     await backfillContracts(db, pool, resolved, "futures", args);
   if (args.target === "options" || args.target === "all")
     await backfillContracts(db, pool, resolved, "options", args);
+  if (args.target === "active" || args.target === "all")
+    await backfillActive(db, pool, resolved, args);
 
   logger.info("Backfill finished", {
     target: args.target,

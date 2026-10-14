@@ -4,7 +4,7 @@ vi.mock("../lib/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { lastCandleDate, settleBseExpiryClose } from "./backfill-history.js";
+import { canonicalContractKey, lastCandleDate, settleBseExpiryClose } from "./backfill-history.js";
 
 const candle = (ts: string) => ({ ts, open: 1, high: 1, low: 1, close: 1, volume: 0, oi: null });
 
@@ -55,5 +55,16 @@ describe("settleBseExpiryClose (BSE expiry-day close = index level)", () => {
     expect(settleBseExpiryClose(bad, contract("CE", 75000, "BSE_FO", "2026-05-21"))).toEqual(untouched); // not expiry day
     expect(settleBseExpiryClose({ ...bad, close: 1.2 }, contract("CE", 75000))).toEqual({ close: 1.2, closeReported: null }); // normal close
     expect(settleBseExpiryClose(bad, contract("CE", 20000))).toEqual(untouched); // not index-like vs strike
+  });
+});
+
+describe("canonicalContractKey (one key per contract for life)", () => {
+  it("builds the expired-style key from segment, token and expiry", () => {
+    expect(canonicalContractKey("NSE_FO", "47983", "2025-04-17")).toBe("NSE_FO|47983|17-04-2025");
+    expect(canonicalContractKey("BSE_FO", "1162668", "2026-01-14")).toBe("BSE_FO|1162668|14-01-2026");
+  });
+
+  it("rejects a malformed expiry instead of inventing a key", () => {
+    expect(() => canonicalContractKey("NSE_FO", "1", "17-04-2025")).toThrow(/YYYY-MM-DD/);
   });
 });

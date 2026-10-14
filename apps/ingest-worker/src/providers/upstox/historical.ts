@@ -311,6 +311,9 @@ export function buildExpiredKey(
  * Duplicates are impossible by construction: the pool only chooses which token sends a request;
  * the caller still decides what to request, one item at a time.
  */
+/** Pool waits at least this long are logged (shorter ones are normal pacing). */
+const WAIT_LOG_THRESHOLD_MS = 30_000;
+
 export class UpstoxHistoricalClientPool {
   private cursor = 0;
 
@@ -341,6 +344,16 @@ export class UpstoxHistoricalClientPool {
       }
     }
     this.cursor = (this.clients.indexOf(best) + 1) % n;
+    // Every account is at its limit: the next call will sleep. Say so, or a long silent pause
+    // (up to ~30 min on the 30-minute window) looks like a hang.
+    if (bestWait >= WAIT_LOG_THRESHOLD_MS) {
+      logger.info("Waiting for Upstox rate limit", {
+        family,
+        waitSeconds: Math.ceil(bestWait / 1000),
+        resumesAt: new Date(Date.now() + bestWait).toISOString(),
+        accounts: n,
+      });
+    }
     return best;
   }
 

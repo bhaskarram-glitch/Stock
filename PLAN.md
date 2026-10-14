@@ -165,9 +165,14 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
   - [x] Deployed 2026-10-13: patch pushed (`e631e6f`), `install.sh` run, 5 Upstox accounts in server `.env`, `check-accounts` green (Plus now verified on every hist account, `219f89b`), Telegram alerts working, first backup + restore test passed
   - [x] Clean refetch 2026-10-13/14: all market data wiped (schema kept) and re-fetched with the fixed code — 693 min, 106,857 contracts, 1,218,656 candles (spot 4,225 · expired contracts 1,214,431), 0 errors, all 369 expiries fully loaded, DB 534 MB
   - [x] Data QA 2026-10-14: 12,782 BSE option candles on their own expiry day carried the INDEX level as `close` (source data error). Fixed: `close` = settlement value (CE max(0, S−K), PE max(0, K−S), S = reported value), original kept in new `market_candles.close_reported` — `0003_bse_expiry_settlement.sql` for existing rows, `settleBseExpiryClose()` in `backfill-history.ts` for new ones. NSE options and all futures unaffected
-  - [ ] Part 2: Object Storage bucket + instance-principal rclone remote
+  - [x] Part 2 (2026-10-14): off-server backups — Object Storage bucket `stock-backups` (private), dynamic group `Default/stock-vm` + policy `stock-vm-backups` (that bucket only), official rclone .deb (Ubuntu's build lacks the Oracle backend) with instance-principal auth (no keys on the server), `RCLONE_REMOTE=oci:stock-backups/daily`, 30 days kept; a cloud copy restored successfully. Backup ≈ 65 MB/day
   - Streaming worker NOT started: needs Phase 4 first (market calendar, reconnect exhaustion, heartbeat)
-- [ ] Data gaps found 2026-10-14 (before Phase 3): history for still-active contracts (only expired ones are fetched today); spot for all NSE/BSE indices (only the 9 F&O indices today); progress log line during rate-limit waits
+- [~] Data gaps (code delivered 2026-10-14)
+  - New backfill target `active` (in `all`, runs last): still-trading futures + options of the 9 indices (~10.6k contracts) via Historical V3, ~1–1.5 h per evening on 5 accounts
+  - One key per contract for life: candles + watermarks use the expired-style key `<segment>|<token>|<DD-MM-YYYY>` from day one (`canonicalContractKey`), so active and post-expiry history form one series; the expired run resumes from the active run's watermark. Verified 2026-10-14: trading key = `segment|token` for 42,776/42,776, expired key format for 107,288/107,288
+  - Spot now covers every index in the instrument master (218: NSE 139, BSE 79), or only `--symbols` when given
+  - Log line `Waiting for Upstox rate limit` whenever every account must wait ≥ 30 s
+  - Phase 4 note: live WS subscribes with trading keys; persisted live candles must be written under the permanent key (`instruments.metadata.trading_key` maps them)
 - [ ] H8 — standard setup & operations document; READ.md/PLAN.md refresh; memory update
 
 ## Phase 3 — Analysis foundation
