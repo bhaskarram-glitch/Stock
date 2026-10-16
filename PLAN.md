@@ -2,8 +2,9 @@
 
 Legend: `[ ]` pending · `[~]` in progress · `[x]` done · `[?n]` blocked on Open Decision n
 Rules: no commit until Phase 0 is complete. GitHub Issues become the tracker after the first commit.
-Direction: index F&O daily history (from 2022-01-01) first → live WS for indexes stored at 1h → analysis → trading.
+Direction: index F&O daily history first → live streaming (Phase 3) → analysis (Phase 4) → trading.
 Decided 2026-09-11: Upstox Plus stays on; multiple Upstox Plus accounts allowed (one token per role).
+Decided 2026-10-16: live streaming (now Phase 3) goes online before analysis (now Phase 4); analysis priorities are re-planned after streaming is live.
 Decided 2026-09-27: host on an Oracle Cloud Always Free VM (prod) with self-hosted Postgres 17 — Supabase and Render are retired once Phase H is done. Laptop (Windows) = dev. Raspberry Pi / own machine possible later.
 
 ## How to work on this repo (for any agent picking this up)
@@ -45,7 +46,7 @@ Decided 2026-09-27: host on an Oracle Cloud Always Free VM (prod) with self-host
 - [x] Late ticks for closed buckets dropped + counted (Bug #13)
 - [x] Price must be finite and > 0 (`??`, explicit checks) in websocket-manager (Bug #14); mapper.ts not fixed — deleted in 0.3 with the legacy trio
 - [x] 1d buckets aligned to IST midnight (new)
-- [x] Pulled forward from Phase 4: sync in-memory update + serial batched upsert queue (Perf #2), `preloadInstrumentIds` fail-fast (Perf #3), injected Supabase client (Perf #4)
+- [x] Pulled forward from live streaming (now Phase 3): sync in-memory update + serial batched upsert queue (Perf #2), `preloadInstrumentIds` fail-fast (Perf #3), injected Supabase client (Perf #4)
 
 ### 0.2 Small bugs (verified 2026-09-13: 38/38 tests)
 
@@ -82,7 +83,7 @@ Decided 2026-09-27: host on an Oracle Cloud Always Free VM (prod) with self-host
 - [x] `0003_drop_legacy.sql` — legacy tables dropped
 - [x] Regenerate `database.types.ts` via `supabase gen types` (CLI login via personal access token from the correct account)
 - [x] `sync-instruments.ts` writes the new typed columns (120,523 rows re-synced)
-- [x] Decisions: keep `ws_failures` (write to it in Phase 4), keep `watchlists`/`provider_accounts` (future API/web; worker tokens stay in env)
+- [x] Decisions: keep `ws_failures` (write to it in Phase 3, live streaming), keep `watchlists`/`provider_accounts` (future API/web; worker tokens stay in env)
 - [x] `infra/docker/Dockerfile` + `docker-compose.yml` + `.dockerignore`; `.env.example` rewritten
 - [x] `UPSTOX_ACCOUNTS` registry in `config.ts` (roles ws/hist/trade, `plus` flag, legacy single-token fallback) + `config.test.ts`; `WORKER_MODE` now validated (unknown → throws)
 
@@ -166,7 +167,7 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
   - [x] Clean refetch 2026-10-13/14: all market data wiped (schema kept) and re-fetched with the fixed code — 693 min, 106,857 contracts, 1,218,656 candles (spot 4,225 · expired contracts 1,214,431), 0 errors, all 369 expiries fully loaded, DB 534 MB
   - [x] Data QA 2026-10-14: 12,782 BSE option candles on their own expiry day carried the INDEX level as `close` (source data error). Fixed: `close` = settlement value (CE max(0, S−K), PE max(0, K−S), S = reported value), original kept in new `market_candles.close_reported` — `0003_bse_expiry_settlement.sql` for existing rows, `settleBseExpiryClose()` in `backfill-history.ts` for new ones. NSE options and all futures unaffected
   - [x] Part 2 (2026-10-14): off-server backups — Object Storage bucket `stock-backups` (private), dynamic group `Default/stock-vm` + policy `stock-vm-backups` (that bucket only), official rclone .deb (Ubuntu's build lacks the Oracle backend) with instance-principal auth (no keys on the server), `RCLONE_REMOTE=oci:stock-backups/daily`, 30 days kept; a cloud copy restored successfully. Backup ≈ 65 MB/day
-  - Streaming worker NOT started: needs Phase 4 first (market calendar, reconnect exhaustion, heartbeat)
+  - Streaming worker NOT started: needs Phase 3 (live streaming) first (market calendar, reconnect exhaustion, heartbeat)
 - [~] Data gaps (code delivered 2026-10-14)
   - New backfill target `active` (in `all`, runs last): still-trading futures + options of the 9 indices (~10.6k contracts) via Historical V3, ~1–1.5 h per evening on 5 accounts
   - One key per contract for life: candles + watermarks use the expired-style key `<segment>|<token>|<DD-MM-YYYY>` from day one (`canonicalContractKey`), so active and post-expiry history form one series; the expired run resumes from the active run's watermark. Verified 2026-10-14: trading key = `segment|token` for 42,776/42,776, expired key format for 107,288/107,288
@@ -174,19 +175,10 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
   - Log line `Waiting for Upstox rate limit` whenever every account must wait ≥ 30 s
   - [x] First run 2026-10-15: spot for 214/218 indices, 3,543 still-trading contracts with history (far-dated ones not traded yet), 187,969 `hist` + 1,217,078 `hist_expired` candles
   - Unsupported keys (2026-10-16): Upstox lists `NSE_INDEX|BHARATBOND-APR30..33` in its master file but rejects them on both history endpoints (UDAPI1021) and on live quotes — verified, not our key handling. Such keys are now recorded once (`backfill_state.is_final` + `skip_reason`, migration `0004_backfill_skip_reason.sql`) and skipped instead of counting as nightly errors; the daily status shows "skipped keys"
-  - Phase 4 note: live WS subscribes with trading keys; persisted live candles must be written under the permanent key (`instruments.metadata.trading_key` maps them)
-- [ ] H8 — standard setup & operations document; READ.md/PLAN.md refresh; memory update
+  - Phase 3 note: live WS subscribes with trading keys; persisted live candles must be written under the permanent key (`instruments.metadata.trading_key` maps them)
+- [x] H8 — setup & operations document delivered 2026-10-16 as a Claude Doc ("Stock Platform — Setup & Operations"); memory updated. Phase H COMPLETE except Supabase retirement on 2026-10-19
 
-## Phase 3 — Analysis foundation
-
-- [ ] Derived daily tables: option chain snapshot per (underlying, expiry, date) — PCR, max pain, OI change, IV (computed locally)
-- [ ] Indicator layer over stored candles
-- [ ] Backtest harness with realistic F&O costs (₹30/order Plus brokerage, STT, exchange fees, slippage)
-- [ ] Trade journal: for every live/paper pick record thesis → outcome → post-mortem (the "why did it fail/succeed" loop)
-
----
-
-## Phase 4 — Live streaming for indexes, unattended
+## Phase 3 — Live streaming, unattended (was Phase 4; moved ahead of analysis 2026-10-16)
 
 - [ ] Worker auth via Analytics Token from account registry (WS role accounts)
 - [ ] Persist 1h candles only (aggregate 1m→1h in memory); 1m/5m optional later
@@ -200,6 +192,15 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
 - [ ] Use Upstox `I1` 1m OHLC from full-mode feed if present for F&O; roll up 5m/15m locally
 - [ ] API fallback persists candles with `source: 'api'` (Bug #6)
 - [ ] EOD reconciliation: live candles vs intraday API
+
+---
+
+## Phase 4 — Analysis foundation (was Phase 3; priorities re-planned once live streaming is online)
+
+- [ ] Derived daily tables: option chain snapshot per (underlying, expiry, date) — PCR, max pain, OI change, IV (computed locally)
+- [ ] Indicator layer over stored candles
+- [ ] Backtest harness with realistic F&O costs (₹30/order Plus brokerage, STT, exchange fees, slippage)
+- [ ] Trade journal: for every live/paper pick record thesis → outcome → post-mortem (the "why did it fail/succeed" loop)
 
 ---
 
@@ -218,7 +219,7 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
 
 ---
 
-## Phase 7 — Trading execution (after Phase 3/5 show an edge)
+## Phase 7 — Trading execution (after Phase 4/5 show an edge)
 
 - [ ] Daily OAuth automation (Access Token Request API, approve via app/WhatsApp)
 - [ ] Order placement (intraday + F&O), positions, risk limits, kill switch
