@@ -187,6 +187,7 @@ async function saveState(
     is_final?: boolean;
     rows_written?: number;
     last_error?: string | null;
+    skip_reason?: string | null;
   },
 ): Promise<void> {
   try {
@@ -261,6 +262,23 @@ async function writeCandles(
   return written;
 }
 
+/**
+ * Upstox rejects some keys it publishes itself (UDAPI1021). Record that once — is_final + the
+ * reason in skip_reason, no last_error — so the key is skipped from now on instead of showing up
+ * as an error every night. Re-enable with:
+ *   update backfill_state set is_final = false, skip_reason = null where skip_reason is not null;
+ * @returns true when the error was of that kind and has been recorded.
+ */
+async function markUnsupported(db: Db, key: string, error: unknown): Promise<boolean> {
+  if (!(error instanceof UpstoxApiError) || !error.isUnsupportedKey) return false;
+  await saveState(db, key, { is_final: true, skip_reason: error.message, last_error: null });
+  logger.warn("Upstox does not support this key; skipping it from now on", {
+    key,
+    reason: error.message,
+  });
+  return true;
+}
+
 /** Retries transient failures; honours Retry-After on 429. Plus/permission errors fail immediately. */
 async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
   let lastError: unknown;
@@ -272,6 +290,7 @@ async function withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
       if (error instanceof UpstoxApiError) {
         if (
           error.isPlusRequired ||
+          error.isUnsupportedKey ||
           error.status === 401 ||
           error.status === 403
         )
@@ -321,6 +340,7 @@ async function backfillSpot(
 
   for (const u of underlyings) {
     const state = states.get(u.instrumentKey);
+    if (state?.is_final) continue; // marked unsupported by Upstox (see markUnsupported)
     const from = state?.last_date ? addDays(state.last_date, 1) : args.from;
     if (from > today) {
       logger.info("Spot up to date", {
@@ -357,6 +377,7 @@ async function backfillSpot(
         candles: written,
       });
     } catch (error) {
+      if (await markUnsupported(db, u.instrumentKey, error)) continue;
       const message = error instanceof Error ? error.message : String(error);
       await saveState(db, u.instrumentKey, { last_error: message });
       logger.error("Spot backfill failed", {
@@ -758,6 +779,10 @@ export async function backfillActive(
         last_error: null,
       });
     } catch (error) {
+      if (await markUnsupported(db, key, error)) {
+        skipped += 1;
+        continue;
+      }
       failed += 1;
       const message = error instanceof Error ? error.message : String(error);
       await saveState(db, key, { last_error: message });

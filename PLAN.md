@@ -172,6 +172,8 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
   - One key per contract for life: candles + watermarks use the expired-style key `<segment>|<token>|<DD-MM-YYYY>` from day one (`canonicalContractKey`), so active and post-expiry history form one series; the expired run resumes from the active run's watermark. Verified 2026-10-14: trading key = `segment|token` for 42,776/42,776, expired key format for 107,288/107,288
   - Spot now covers every index in the instrument master (218: NSE 139, BSE 79), or only `--symbols` when given
   - Log line `Waiting for Upstox rate limit` whenever every account must wait ≥ 30 s
+  - [x] First run 2026-10-15: spot for 214/218 indices, 3,543 still-trading contracts with history (far-dated ones not traded yet), 187,969 `hist` + 1,217,078 `hist_expired` candles
+  - Unsupported keys (2026-10-16): Upstox lists `NSE_INDEX|BHARATBOND-APR30..33` in its master file but rejects them on both history endpoints (UDAPI1021) and on live quotes — verified, not our key handling. Such keys are now recorded once (`backfill_state.is_final` + `skip_reason`, migration `0004_backfill_skip_reason.sql`) and skipped instead of counting as nightly errors; the daily status shows "skipped keys"
   - Phase 4 note: live WS subscribes with trading keys; persisted live candles must be written under the permanent key (`instruments.metadata.trading_key` maps them)
 - [ ] H8 — standard setup & operations document; READ.md/PLAN.md refresh; memory update
 

@@ -4,6 +4,7 @@ vi.mock("../lib/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
+import { UpstoxApiError } from "../providers/upstox/historical.js";
 import { canonicalContractKey, lastCandleDate, settleBseExpiryClose } from "./backfill-history.js";
 
 const candle = (ts: string) => ({ ts, open: 1, high: 1, low: 1, close: 1, volume: 0, oi: null });
@@ -66,5 +67,13 @@ describe("canonicalContractKey (one key per contract for life)", () => {
 
   it("rejects a malformed expiry instead of inventing a key", () => {
     expect(() => canonicalContractKey("NSE_FO", "1", "17-04-2025")).toThrow(/YYYY-MM-DD/);
+  });
+});
+
+describe("UpstoxApiError.isUnsupportedKey", () => {
+  it("is true only for UDAPI1021 (key Upstox will never serve)", () => {
+    expect(new UpstoxApiError("Instrument key is of invalid format", 400, "UDAPI1021", null).isUnsupportedKey).toBe(true);
+    expect(new UpstoxApiError("rate limited", 429, null, 1000).isUnsupportedKey).toBe(false);
+    expect(new UpstoxApiError("plus needed", 403, "UDAPI1149", null).isUnsupportedKey).toBe(false);
   });
 });

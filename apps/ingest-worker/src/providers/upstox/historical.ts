@@ -71,6 +71,14 @@ export class UpstoxApiError extends Error {
   get isPlusRequired(): boolean {
     return this.code === "UDAPI1149";
   }
+  /**
+   * UDAPI1021 "Instrument key is of invalid format": Upstox will never serve this key. Seen
+   * 2026-10-16 for keys Upstox itself lists in its master file (NSE_INDEX|BHARATBOND-APR30..33);
+   * the live-quote API rejects them too. Retrying cannot help.
+   */
+  get isUnsupportedKey(): boolean {
+    return this.code === "UDAPI1021";
+  }
 }
 
 interface UpstoxEnvelope<T> {

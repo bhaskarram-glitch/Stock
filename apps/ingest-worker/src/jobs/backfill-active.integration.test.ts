@@ -10,7 +10,7 @@ vi.mock("../lib/logger.js", () => ({
 }));
 
 import { createDb, type ClosableDb } from "../lib/db.js";
-import type { UpstoxHistoricalClientPool, HistoricalCandle } from "../providers/upstox/historical.js";
+import { UpstoxApiError, type UpstoxHistoricalClientPool, type HistoricalCandle } from "../providers/upstox/historical.js";
 import type { ResolvedUnderlying } from "../providers/upstox/indices.js";
 import { backfillActive, type BackfillArgs } from "./backfill-history.js";
 
@@ -20,6 +20,8 @@ const ACTIVE_KEY = "NSE_FO|990001"; // trading key
 const CANON_KEY = "NSE_FO|990001|30-12-2099"; // permanent key
 const EXPIRING_ACTIVE = "BSE_FO|990002";
 const EXPIRING_CANON = "BSE_FO|990002|30-12-2099";
+const UNSUPPORTED_ACTIVE = "NSE_FO|990003";
+const UNSUPPORTED_CANON = "NSE_FO|990003|30-12-2099";
 
 const day = (d: string, close: number): HistoricalCandle => ({
   ts: `${d}T09:15:00+05:30`, open: close, high: close + 1, low: close - 1, close, volume: 10, oi: 5,
@@ -29,6 +31,9 @@ function fakePool(byKey: Record<string, HistoricalCandle[]>, calls: string[]): U
   return {
     getHistoricalCandles: async (key: string, _u: string, _i: number, from: string, to: string) => {
       calls.push(`${key} ${from}..${to}`);
+      if (key === UNSUPPORTED_ACTIVE) {
+        throw new UpstoxApiError("Instrument key is of invalid format", 400, "UDAPI1021", null);
+      }
       return (byKey[key] ?? []).filter((c) => c.ts.slice(0, 10) >= from && c.ts.slice(0, 10) <= to);
     },
     usage: () => ({ lastThirtyMinutes: 0, budgetThirtyMinutes: 0, perAccount: {} }),
@@ -55,8 +60,9 @@ describe.skipIf(!url)("backfillActive (Postgres)", () => {
       `insert into instruments (provider, provider_instrument_key, exchange, segment, trading_symbol, name,
          instrument_type, exchange_token, underlying_key, expiry, strike, option_type)
        values ('upstox', $1, 'NSE', 'NSE_FO', 'ZZ 100 CE', 'ZZ', 'CE', '990001', $3, '2099-12-30', 100, 'CE'),
-              ('upstox', $2, 'BSE', 'BSE_FO', 'ZZ 100 PE', 'ZZ', 'PE', '990002', $3, '2099-12-30', 100, 'PE')`,
-      [ACTIVE_KEY, EXPIRING_ACTIVE, UNDERLYING],
+              ('upstox', $2, 'BSE', 'BSE_FO', 'ZZ 100 PE', 'ZZ', 'PE', '990002', $3, '2099-12-30', 100, 'PE'),
+              ('upstox', $4, 'NSE', 'NSE_FO', 'ZZ 200 CE', 'ZZ', 'CE', '990003', $3, '2099-12-30', 200, 'CE')`,
+      [ACTIVE_KEY, EXPIRING_ACTIVE, UNDERLYING, UNSUPPORTED_ACTIVE],
     );
     // …and the second one already registered by an expired run (must stay is_expired = true).
     await db.query(
@@ -101,5 +107,15 @@ describe.skipIf(!url)("backfillActive (Postgres)", () => {
       [EXPIRING_CANON],
     );
     expect(rows[0]).toEqual({ is_expired: true, n: 1 });
+  });
+
+  it("records a key Upstox rejects (UDAPI1021) once, without an error, and never asks again", async () => {
+    const st = await db.query<{ is_final: boolean; last_error: string | null; skip_reason: string | null }>(
+      "select is_final, last_error, skip_reason from backfill_state where instrument_key = $1", [UNSUPPORTED_CANON]);
+    expect(st.rows[0]).toEqual({ is_final: true, last_error: null, skip_reason: "Instrument key is of invalid format" });
+
+    const calls: string[] = [];
+    await backfillActive(db, fakePool({}, calls), underlyings, args);
+    expect(calls.some((c) => c.startsWith(UNSUPPORTED_ACTIVE))).toBe(false);
   });
 });

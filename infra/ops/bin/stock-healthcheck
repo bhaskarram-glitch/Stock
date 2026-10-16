@@ -36,6 +36,7 @@ if [ "${1:-}" = "--summary" ]; then
     db="$(pg_sql "select 'db ' || pg_size_pretty(pg_database_size('stock'))
       || ' · candles ' || (select count(*) from market_candles)
       || ' · backfill errors ' || (select count(*) from backfill_state where last_error is not null)
+      || ' · skipped keys ' || (select count(*) from backfill_state where skip_reason is not null)
       || ' · last backfill ' || coalesce(to_char(max(last_run_at) at time zone 'Asia/Kolkata', 'DD Mon HH24:MI'), 'never')
       from backfill_state")"
   else
