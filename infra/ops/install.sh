@@ -40,4 +40,8 @@ timers=()
 for t in "$here"/systemd/*.timer; do timers+=("$(basename "$t")"); done
 systemctl enable --now "${timers[@]}" >/dev/null
 echo "enabled: ${timers[*]}"
+# Live stream also starts at boot, so a reboot during market hours resumes streaming
+# (outside market hours it exits at once). Not started here: the timer starts it at 09:00 IST.
+systemctl enable stock-stream.service >/dev/null
+echo "enabled at boot: stock-stream.service"
 systemctl list-timers 'stock-*' --no-pager

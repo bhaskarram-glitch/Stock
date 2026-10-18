@@ -1,0 +1,10 @@
+# infra/ops/systemd/stock-stream.timer — installed and enabled by infra/ops/install.sh
+[Unit]
+Description=Start the live stream before market open
+
+[Timer]
+OnCalendar=Mon..Fri 09:00 Asia/Kolkata
+Persistent=true
+
+[Install]
+WantedBy=timers.target

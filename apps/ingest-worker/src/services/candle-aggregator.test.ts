@@ -1,3 +1,4 @@
+import type { CandleData } from "./candle-aggregator.js";
 import { describe, expect, it, vi } from "vitest";
 import { CandleAggregator } from "./candle-aggregator.js";
 import { CumulativeVolumeTracker } from "./volume-tracker.js";
@@ -205,5 +206,20 @@ describe("CandleAggregator", () => {
     await agg.flushAllBuckets();
     // 2026-09-11 00:00 IST == 2026-09-10 18:30 UTC
     expect(db.rows()[0].bucket_start).toBe("2026-09-10T18:30:00.000Z");
+  });
+
+  it("aligns hourly candles to the 09:15 IST open", async () => {
+    const saved: CandleData[] = [];
+    const t = Date.parse("2026-10-19T10:20:00+05:30");
+    const agg = new CandleAggregator({} as never, {
+      activeIntervals: ["1h", "15m"],
+      now: () => t,
+      sink: { persist: async (c) => void saved.push(...c) },
+    });
+    await agg.processTick("K", 1, 0, new Date(t));
+    await agg.flushAllBuckets();
+    const start = (i: string) => saved.find((c) => c.interval === i)!.bucket_start.toISOString();
+    expect(start("1h")).toBe(new Date("2026-10-19T10:15:00+05:30").toISOString());
+    expect(start("15m")).toBe(new Date("2026-10-19T10:15:00+05:30").toISOString());
   });
 });

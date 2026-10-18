@@ -187,12 +187,16 @@ Granularity: 1m + 5m / 15m / 60m candles. 15m and 60m kept permanently; how long
 - [x] Worker auth via Analytics Token from the account registry (`ws` role)
 - [x] Host: Oracle VM via docker compose (Phase H)
 - [ ] 6th Upstox Plus account + Analytics Token → `UPSTOX_ACCOUNT_6_*` on the server; `check-accounts` green (user)
-- [ ] 3.1 Universe + sharding: 9 spots + all still-trading index futures/options, read from `instruments` and refreshed daily after the 08:00 sync; split across `ws` accounts, ≤ 2,000 keys each; if over capacity, drop the farthest expiries first and log what was left out
-- [ ] 3.2 Streaming worker: one connection per account, `full` mode, resubscribe after reconnect; capped exponential backoff that never gives up silently (Bug #8); pong-timeout heartbeat + `heartbeat_ts` (Bug #12); candles stored under the permanent contract keys; use the feed's own 1m OHLC (`I1`) where present; debug-level tick logs (Perf #5)
-- [ ] 3.3 Intraday storage: compact candle table partitioned by day (integer instrument ids, no per-row uuid/text key) for 1m/5m/15m/60m; one batched write per minute; nightly backup leaves out 1m/5m
-- [ ] 3.4 Market-hours lifecycle: start 09:00, stop 15:45 IST Mon–Fri via systemd; skip exchange holidays (Upstox holidays API); flush open candles on stop
+- [x] 3.1 Universe + sharding (delivered 2026-10-18): `services/live-universe.ts` — 9 spots + all still-trading index futures/options read from `instruments` at worker start (after the 08:00 sync); permanent keys registered via `services/contract-registry.ts` (shared with backfill `active`); spot > futures > options by nearest expiry, round-robin across `ws` accounts, ≤ 2,000 each; overflow (farthest expiries) logged
+- [x] 3.2 Streaming worker (delivered 2026-10-18): `services/live-stream.ts` + `index.ts` — one connection per account, `full` mode, subscribe in 500-key frames, resubscribe on reconnect; reconnect forever, backoff capped at 60 s, also after a server-side 1000 close (Bug #8); pong/traffic heartbeat 15 s → terminate + reconnect (Bug #12); tick used only when last-trade time or price changes, first tick per instrument = baseline; candle time = exchange ltt; latest OI carried; exits 1 if no connection for 10 min; status log every 60 s; debug-level tick logs (Perf #5)
+  - Deviation: candles are built from ticks, not the feed's `I1` OHLC (its timing semantics unverified). Full mode is a snapshot feed, so a minute's true high/low can be missed → corrected by 3.7. One `Feed sample` log line per minute (raw I1) to verify on the measuring day. `heartbeat_ts` column not added (logs + 3.6 alerts cover it).
+- [x] 3.3 Intraday storage (delivered 2026-10-18): migration `0005_live_candles.sql` — `instruments.sid` (int); `live_candles_fine` 1m/5m per IST day, `live_candles` 15m/60m per IST month; `ensure_live_partitions(day)` callable by `stock_app`; `services/live-candle-sink.ts` batched `unnest` upsert, restart-safe merge, index spot volume NULL; nightly backup leaves out `live_candles_fine*` data
+  - 60m buckets start at 09:15 IST (09:15, 10:15 … 15:15), like exchange charts; 15m on :00/:15/:30/:45
+- [x] 3.4 Market-hours lifecycle (delivered 2026-10-18): `stock-stream.service` (+ enabled at boot) + `stock-stream.timer` Mon–Fri 09:00 IST; worker exits 0 at 15:45, outside 08:50–15:45, weekends and F&O holidays (`providers/upstox/market-calendar.ts`, Upstox holidays API, fails open); systemd restarts on failure (6/h, then alert); open candles written on stop; `stock-deploy` no longer restarts the stream — prints `sudo systemctl restart stock-stream`
+  - Not covered: special sessions (Muhurat trading)
 - [ ] 3.5 Measuring day: one full session; record rows/day, GB/day, CPU, memory, ticks/s → decide 1m/5m retention
-- [ ] 3.6 Alerts: worker exited during market hours, an account disconnected > 2 min, no ticks for 5 min; daily status gains live-feed figures
+- [ ] 3.6 Alerts: worker exited during market hours, an account disconnected > 2 min, no ticks for 5 min (daily status already shows live instruments + 1m candles today)
+- [ ] Remove obsolete `services/websocket-manager.ts` + `services/health-monitor.ts` once live is stable
 - [ ] 3.7 End-of-day reconciliation vs Upstox 1-minute history; gaps filled from history and marked `source = 'api'` (Bug #6)
 
 ---

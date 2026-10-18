@@ -14,7 +14,9 @@ out="$BACKUP_DIR/stock_$(date +%F_%H%M).dump"
 tmp="$out.partial"
 trap 'rm -f "$tmp"' EXIT
 
-docker exec "$PG_CONTAINER" pg_dump -U postgres -d stock -Fc -Z 6 >"$tmp"
+# 1m/5m live candles are excluded (rolling, large, re-fetchable from Upstox); 15m/60m are kept.
+docker exec "$PG_CONTAINER" pg_dump -U postgres -d stock -Fc -Z 6 \
+  --exclude-table-data 'live_candles_fine*' >"$tmp"
 
 toc="$(docker exec -i "$PG_CONTAINER" pg_restore --list <"$tmp")"
 if ! grep -q "TABLE DATA public market_candles" <<<"$toc"; then

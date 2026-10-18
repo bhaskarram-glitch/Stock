@@ -57,6 +57,19 @@ export type UpstoxWSTick = {
     high?: number;
     low?: number;
     close?: number;
+    /** "I1" (1-minute) when the feed carries it, else "1d" */
+    interval?: string;
+    /** candle start */
+    ts?: string;
   };
   raw?: unknown;
+};
+
+/** One entry of GET /v2/market/holidays. */
+export type UpstoxMarketHoliday = {
+  date: string; // YYYY-MM-DD
+  description?: string;
+  holiday_type?: "TRADING_HOLIDAY" | "SETTLEMENT_HOLIDAY" | "SPECIAL_TIMING" | string;
+  closed_exchanges?: string[];
+  open_exchanges?: Array<{ exchange: string; start_time?: number; end_time?: number }>;
 };

@@ -1,4 +1,7 @@
-type LogLevel = "INFO" | "WARN" | "ERROR";
+type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
+
+/** LOG_LEVEL=debug turns on per-tick/per-candle detail (off by default: Perf #5). */
+const debugEnabled = (process.env.LOG_LEVEL ?? "").trim().toLowerCase() === "debug";
 
 function write(level: LogLevel, message: string, meta?: Record<string, unknown>) {
   const payload = {
@@ -19,6 +22,9 @@ function write(level: LogLevel, message: string, meta?: Record<string, unknown>)
 }
 
 export const logger = {
+  debug(message: string, meta?: Record<string, unknown>) {
+    if (debugEnabled) write("DEBUG", message, meta);
+  },
   info(message: string, meta?: Record<string, unknown>) {
     write("INFO", message, meta);
   },

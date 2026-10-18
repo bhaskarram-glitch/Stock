@@ -20,6 +20,7 @@ class FakeSocket extends EventEmitter implements UpstoxWebSocketLike {
   readyState = 0;
   readonly sent: Buffer[] = [];
   readonly ping = vi.fn();
+  readonly terminate = vi.fn(() => this.serverClose(1006, "terminated"));
 
   send(data: Buffer, callback?: (error?: Error) => void): void {
     this.sent.push(Buffer.from(data));
@@ -214,5 +215,80 @@ describe("UpstoxWebSocketClient", () => {
 
     expect(authorizeMarketDataFeed).toHaveBeenCalledTimes(2);
     expect(sockets).toHaveLength(2);
+  });
+
+  it("reconnects after a server-side normal close (1000) too", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    authorizeMarketDataFeed.mockResolvedValue("wss://stream.upstox.com/feed/market-data?code=x");
+    const client = new UpstoxWebSocketClient({
+      upstoxClient: { authorizeMarketDataFeed },
+      reconnectDelay: 10,
+      socketFactory: () => { const s = new FakeSocket(); sockets.push(s); return s; },
+    });
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    sockets[0].open();
+    sockets[0].serverClose(1000, "server bye");
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sockets).toHaveLength(2);
+    client.disconnect();
+  });
+
+  it("never gives up reconnecting and caps the delay", async () => {
+    vi.useFakeTimers();
+    authorizeMarketDataFeed.mockRejectedValue(new Error("network down"));
+    const client = new UpstoxWebSocketClient({
+      upstoxClient: { authorizeMarketDataFeed },
+      reconnectDelay: 1000,
+      maxReconnectDelay: 4000,
+      socketFactory: () => new FakeSocket(),
+    });
+    client.connect();
+    // attempts at +1s, +2s, +4s, then every 4s (capped): 12 attempts within 1+2+4+4*9 = 43s
+    await vi.advanceTimersByTimeAsync(43_000);
+    expect(authorizeMarketDataFeed).toHaveBeenCalledTimes(13);
+    client.disconnect();
+  });
+
+  it("terminates a silent socket after a missed pong and reconnects", async () => {
+    vi.useFakeTimers();
+    const sockets: FakeSocket[] = [];
+    authorizeMarketDataFeed.mockResolvedValue("wss://stream.upstox.com/feed/market-data?code=x");
+    const client = new UpstoxWebSocketClient({
+      upstoxClient: { authorizeMarketDataFeed },
+      heartbeatInterval: 1000,
+      reconnectDelay: 10,
+      socketFactory: () => { const s = new FakeSocket(); sockets.push(s); return s; },
+    });
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    sockets[0].open();
+    await vi.advanceTimersByTimeAsync(1000); // ping
+    sockets[0].emit("pong");
+    await vi.advanceTimersByTimeAsync(1000); // ping again, answered above → fine
+    expect(sockets[0].terminate).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1000); // no pong since last ping → dead
+    expect(sockets[0].terminate).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(20);
+    expect(sockets).toHaveLength(2);
+    client.disconnect();
+  });
+
+  it("subscribes in chunks", async () => {
+    const sockets: FakeSocket[] = [];
+    authorizeMarketDataFeed.mockResolvedValue("wss://stream.upstox.com/feed/market-data?code=x");
+    const client = new UpstoxWebSocketClient({
+      upstoxClient: { authorizeMarketDataFeed },
+      subscribeChunkSize: 2,
+      socketFactory: () => { const s = new FakeSocket(); sockets.push(s); return s; },
+    });
+    client.connect();
+    await vi.waitFor(() => expect(sockets).toHaveLength(1));
+    sockets[0].open();
+    client.subscribe(["A", "B", "C", "A"]);
+    expect(sockets[0].sent).toHaveLength(2);
+    expect(client.getSubscribedInstruments().sort()).toEqual(["A", "B", "C"]);
+    client.disconnect();
   });
 });

@@ -276,6 +276,8 @@ function normalizeFeedTick(
           high: asNumber(ohlc.high),
           low: asNumber(ohlc.low),
           close: asNumber(ohlc.close),
+          interval: ohlc.interval,
+          ts: toIsoTimestamp(asNumber(ohlc.ts)),
         }
       : undefined,
   };

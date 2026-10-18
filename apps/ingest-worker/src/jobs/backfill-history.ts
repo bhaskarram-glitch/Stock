@@ -34,7 +34,14 @@ import "dotenv/config.js";
 import { describeAccount, loadConfig } from "../config.js";
 import { logger } from "../lib/logger.js";
 import { closeDb, getDb, upsertRows, type Db } from "../lib/db.js";
+import {
+  canonicalContractKey,
+  loadActiveContracts,
+  registerPermanentContracts,
+} from "../services/contract-registry.js";
 import type { CandleInsert, InstrumentInsert, Json } from "../lib/db-types.js";
+
+export { canonicalContractKey };
 import {
   UpstoxApiError,
   UpstoxHistoricalClient,
@@ -96,17 +103,6 @@ export function lastCandleDate(candles: HistoricalCandle[]): string | null {
   return latest === null
     ? null
     : new Date(new Date(latest).getTime() + IST_OFFSET_MS).toISOString().slice(0, 10);
-}
-
-/**
- * The permanent key for a derivative contract: `<segment>|<exchange_token>|<DD-MM-YYYY expiry>`,
- * i.e. the key Upstox uses once the contract has expired. Verified 2026-10-14 against every row:
- * trading key = `<segment>|<exchange_token>` (42,776/42,776), expired key = this (107,288/107,288).
- */
-export function canonicalContractKey(segment: string, exchangeToken: string, expiry: string): string {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(expiry);
-  if (!m) throw new Error(`Bad expiry date "${expiry}" (want YYYY-MM-DD)`);
-  return `${segment}|${exchangeToken}|${m[3]}-${m[2]}-${m[1]}`;
 }
 
 /**
@@ -643,26 +639,6 @@ async function backfillContracts(
   }
 }
 
-/** A still-trading index contract as synced from the Upstox instrument master. */
-interface ActiveContractRow {
-  provider_instrument_key: string;
-  exchange: string;
-  segment: string;
-  trading_symbol: string;
-  name: string;
-  instrument_type: string | null;
-  exchange_token: string;
-  tick_size: string | null; // numeric → string from pg
-  lot_size: number | null;
-  underlying_key: string;
-  underlying_symbol: string | null;
-  expiry: string;
-  strike: string | null;
-  option_type: string | null;
-  weekly: boolean | null;
-  metadata: Json | null;
-}
-
 const ACTIVE_PROGRESS_EVERY = 500;
 
 /**
@@ -677,68 +653,21 @@ export async function backfillActive(
   args: BackfillArgs,
 ): Promise<void> {
   const today = todayIst();
-  const { rows: contracts } = await db.query<ActiveContractRow>(
-    `select provider_instrument_key, exchange, segment, trading_symbol, name, instrument_type,
-            exchange_token, tick_size, lot_size, underlying_key, underlying_symbol, expiry, strike,
-            option_type, weekly, metadata
-       from instruments
-      where segment in ('NSE_FO', 'BSE_FO')
-        and expiry >= $1::date
-        and provider_instrument_key = segment || '|' || exchange_token
-        and underlying_key = any($2::text[])
-      order by expiry, underlying_key, option_type nulls first, strike`,
-    [today, underlyings.map((u) => u.instrumentKey)],
+  const work = await loadActiveContracts(
+    db,
+    underlyings.map((u) => u.instrumentKey),
+    today,
   );
-  const work = contracts.map((r) => ({
-    row: r,
-    key: canonicalContractKey(r.segment, r.exchange_token, r.expiry),
-  }));
   logger.info("Active contracts", {
     contracts: work.length,
     byUnderlying: Object.fromEntries(
-      underlyings.map((u) => [u.symbol, contracts.filter((c) => c.underlying_key === u.instrumentKey).length]),
+      underlyings.map((u) => [u.symbol, work.filter((c) => c.row.underlying_key === u.instrumentKey).length]),
     ),
   });
   if (work.length === 0 || args.dryRun) return;
 
-  // Create the permanent-key instrument rows that don't exist yet. DO NOTHING on conflict: a row
-  // the expired run already wrote (contract expiring today) must not be flipped back to active.
-  await upsertRows(
-    db,
-    "instruments",
-    work.map(({ row: r, key }) => ({
-      provider: "upstox",
-      provider_instrument_key: key,
-      exchange: r.exchange,
-      segment: r.segment,
-      trading_symbol: r.trading_symbol,
-      name: r.name,
-      isin: null,
-      instrument_type: r.instrument_type,
-      exchange_token: r.exchange_token,
-      tick_size: r.tick_size === null ? null : Number(r.tick_size),
-      lot_size: r.lot_size,
-      underlying_key: r.underlying_key,
-      underlying_symbol: r.underlying_symbol,
-      expiry: r.expiry,
-      strike: r.strike === null ? null : Number(r.strike),
-      option_type: r.option_type,
-      weekly: r.weekly,
-      is_expired: false,
-      is_active: true,
-      metadata: <Json>{ trading_key: r.provider_instrument_key },
-    })),
-    { conflict: ["provider", "provider_instrument_key"], ignoreDuplicates: true },
-  );
-  const idByKey = new Map<string, string>();
-  for (let i = 0; i < work.length; i += 1000) {
-    const { rows } = await db.query<{ id: string; provider_instrument_key: string }>(
-      `select id, provider_instrument_key from instruments
-        where provider = 'upstox' and provider_instrument_key = any($1::text[])`,
-      [work.slice(i, i + 1000).map((w) => w.key)],
-    );
-    for (const r of rows) idByKey.set(r.provider_instrument_key, r.id);
-  }
+  const ids = await registerPermanentContracts(db, work);
+  const idByKey = new Map(Array.from(ids, ([k, v]) => [k, v.id]));
   const states = await loadStates(db, work.map((w) => w.key));
 
   let processed = 0;

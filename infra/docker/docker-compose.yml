@@ -4,7 +4,7 @@
 # On the server, from the repo checkout (DB must be up first — it creates the `stock-net` network):
 #   docker compose -f infra/docker/docker-compose.yml build
 #   docker compose -f infra/docker/docker-compose.yml run --rm migrate          # before every deploy
-#   docker compose -f infra/docker/docker-compose.yml up -d ingest-worker
+#   (live streaming is started by systemd: sudo systemctl start stock-stream — never `up -d`)
 #   docker compose -f infra/docker/docker-compose.yml run --rm sync-instruments
 #   docker compose -f infra/docker/docker-compose.yml run --rm backfill spot     # args go to the job
 #
@@ -27,8 +27,10 @@ services:
       dockerfile: infra/docker/Dockerfile
     environment:
       WORKER_MODE: websocket-stream
-    restart: unless-stopped
-    stop_grace_period: 30s # time to flush open candles on SIGTERM
+    # Run by stock-stream.service (via stock-job, container name stock-stream), which owns
+    # start/stop/restart. Docker must not restart it on its own.
+    restart: "no"
+    stop_grace_period: 60s # time to write open candles on SIGTERM
 
   migrate:
     <<: *app

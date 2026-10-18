@@ -39,6 +39,12 @@ if [ "${1:-}" = "--summary" ]; then
       || ' · skipped keys ' || (select count(*) from backfill_state where skip_reason is not null)
       || ' · last backfill ' || coalesce(to_char(max(last_run_at) at time zone 'Asia/Kolkata', 'DD Mon HH24:MI'), 'never')
       from backfill_state")"
+    if [ "$(pg_sql "select to_regclass('public.live_candles_fine') is not null")" = t ]; then
+      db="$db
+$(pg_sql "select 'live today: ' || count(distinct sid) || ' instruments · ' || count(*) || ' 1m candles'
+      from live_candles_fine where interval_min = 1
+       and bucket_start >= (now() at time zone 'Asia/Kolkata')::date::timestamp at time zone 'Asia/Kolkata'")"
+    fi
   else
     db="db unavailable"
   fi

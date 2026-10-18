@@ -5,6 +5,7 @@
 #   stock-job backfill all                 # args after the job name go to the job
 #   stock-job backfill options --symbols NIFTY --limit 500
 #   stock-job migrate
+#   stock-job ingest-worker                # live streaming; normally only via stock-stream.service
 # Exit code = the job's exit code. A second run of the same job while one is active exits 75
 # ("already running") instead of doubling API usage.
 set -euo pipefail
@@ -13,8 +14,8 @@ set -euo pipefail
 
 job="${1:?usage: stock-job <job> [args...]}"
 case "$job" in
-  migrate | sync-instruments | backfill | check-accounts) ;;
-  *) echo "unknown job '$job' (migrate | sync-instruments | backfill | check-accounts)" >&2; exit 2 ;;
+  migrate | sync-instruments | backfill | check-accounts | ingest-worker) ;;
+  *) echo "unknown job '$job' (migrate | sync-instruments | backfill | check-accounts | ingest-worker)" >&2; exit 2 ;;
 esac
 
 mkdir -p "$STOCK_STATE_DIR"
@@ -25,4 +26,9 @@ if ! flock -n 9; then
 fi
 
 cd "$STOCK_DIR"
+if [ "$job" = ingest-worker ]; then
+  # fixed name so stock-stream.service can stop it cleanly (docker stop → SIGTERM → candles written)
+  docker rm -f stock-stream >/dev/null 2>&1 || true
+  exec docker compose -f "$COMPOSE_FILE" run --rm -T --name stock-stream "$@"
+fi
 docker compose -f "$COMPOSE_FILE" run --rm -T "$@"

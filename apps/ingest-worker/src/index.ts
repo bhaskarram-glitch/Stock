@@ -4,20 +4,17 @@ import { logger } from "./lib/logger.js";
 import { closeDb, getDb } from "./lib/db.js";
 import { createUpstoxClientFromEnv } from "./providers/upstox/client.js";
 import {
-  CandleAggregator,
-  type CandleInterval,
-} from "./services/candle-aggregator.js";
-import { HealthMonitor } from "./services/health-monitor.js";
-import { WebSocketManager } from "./services/websocket-manager.js";
+  FNO_INDEX_UNDERLYINGS,
+  resolveUnderlyings,
+  type IndexInstrumentRow,
+} from "./providers/upstox/indices.js";
+import { decideSession, istClock, parseHhMm } from "./providers/upstox/market-calendar.js";
+import { CandleAggregator, type CandleInterval } from "./services/candle-aggregator.js";
+import { LiveCandleSink } from "./services/live-candle-sink.js";
+import { LiveStream } from "./services/live-stream.js";
+import { describeDropped, loadLiveUniverse, planShards } from "./services/live-universe.js";
 
-const ACTIVE_INTERVALS: CandleInterval[] = ["1m", "5m", "15m", "1h"];
-
-// Defaults for local runs only; production sets UPSTOX_INSTRUMENT_KEYS.
-const DEFAULT_INSTRUMENTS = [
-  "NSE_EQ|INE002A01018", // Reliance
-  "NSE_EQ|INE009A01021", // Infosys
-  "NSE_EQ|INE238A01034", // Tata Steel
-];
+const LIVE_INTERVALS: CandleInterval[] = ["1m", "5m", "15m", "1h"];
 
 /** Verifies config + DB reachability. Exit code is the signal; used by supervisors and CI. */
 async function runHealthcheck(
@@ -36,85 +33,108 @@ async function runHealthcheck(
   await closeDb();
 }
 
-async function runWebsocketStream(
-  config: ReturnType<typeof loadConfig>,
-): Promise<void> {
+/**
+ * Live streaming (Phase 3). Started by stock-stream.timer on weekdays; exits 0 by itself at
+ * LIVE_STOP, at once outside the window / on weekends / on F&O holidays, and exits 1 (→ systemd
+ * restarts it) if no Upstox connection has been up for 10 minutes.
+ */
+async function runWebsocketStream(config: ReturnType<typeof loadConfig>): Promise<void> {
   if (!config.databaseUrl) throw new Error("websocket-stream requires DATABASE_URL");
-  // Streaming uses the first account holding the `ws` role. Sharding across several ws accounts
-  // (2,000 keys per connection) arrives with Phase 4.
-  const wsAccount = config.upstoxAccounts.require("ws");
-  logger.info("Streaming account", describeAccount(wsAccount));
+  const wsAccounts = config.upstoxAccounts.forRole("ws");
+  if (wsAccounts.length === 0) config.upstoxAccounts.require("ws"); // throws with guidance
+  const clients = new Map(
+    wsAccounts.map((a) => [a.alias, createUpstoxClientFromEnv(a.token, config.upstoxBaseUrl)]),
+  );
+
+  const startMin = parseHhMm(config.live.startTime);
+  const stopMin = parseHhMm(config.live.stopTime);
+  const decision = await decideSession(Date.now(), { startMin, stopMin }, () =>
+    clients.get(wsAccounts[0].alias)!.fetchMarketHolidays(),
+  );
+  if (!decision.stream) {
+    logger.info("Not streaming today", { reason: decision.reason });
+    await closeDb();
+    return;
+  }
 
   const db = getDb();
-  const upstoxClient = createUpstoxClientFromEnv(
-    wsAccount.token,
-    config.upstoxBaseUrl,
+  const today = istClock(Date.now()).date;
+  const { rows: indexRows } = await db.query<IndexInstrumentRow>(
+    `select id, provider_instrument_key, trading_symbol, name, segment
+       from instruments where segment in ('NSE_INDEX', 'BSE_INDEX')`,
   );
-  const candleAggregator = new CandleAggregator(db, {
-    activeIntervals: ACTIVE_INTERVALS,
+  const wanted =
+    config.live.symbols.length > 0
+      ? FNO_INDEX_UNDERLYINGS.filter((u) => config.live.symbols.includes(u.symbol))
+      : FNO_INDEX_UNDERLYINGS;
+  const { resolved, unresolved } = resolveUnderlyings(wanted, indexRows);
+  if (unresolved.length > 0) {
+    logger.error("Could not resolve these underlyings", { symbols: unresolved.map((u) => u.symbol) });
+  }
+  if (resolved.length === 0) throw new Error("No underlyings resolved — run sync-instruments first");
+
+  const universe = await loadLiveUniverse(db, resolved, today);
+  const plan = planShards(universe, wsAccounts.map((a) => a.alias), config.live.keysPerAccount);
+  const kinds = (k: string) => universe.filter((i) => i.kind === k).length;
+  logger.info("Live universe", {
+    date: today,
+    underlyings: resolved.map((u) => u.symbol),
+    total: universe.length,
+    spots: kinds("spot"),
+    futures: kinds("future"),
+    options: kinds("option"),
+    capacity: plan.capacity,
+    accounts: wsAccounts.map(describeAccount),
   });
-  const healthMonitor = new HealthMonitor({
-    db,
-    upstoxClient,
-    healthCheckInterval: 30_000,
-    apiFallbackDelay: 60_000,
-    apiFallbackInterval: 3_600_000,
-  });
+  if (plan.dropped.length > 0) {
+    logger.warn("Universe exceeds account capacity; farthest expiries left out", describeDropped(plan.dropped));
+  }
 
-  const initialInstruments =
-    config.upstoxInstrumentKeys.length > 0
-      ? config.upstoxInstrumentKeys
-      : DEFAULT_INSTRUMENTS;
-
-  const wsManager = new WebSocketManager(
-    candleAggregator,
-    healthMonitor,
-    upstoxClient,
-    {
-      activeIntervals: ACTIVE_INTERVALS,
-      maxInstruments: 2000, // Upstox full-mode cap per connection
-      initialInstruments,
-    },
-  );
-
-  await wsManager.start();
-  logger.info("WebSocket streaming started", {
-    instruments: initialInstruments.length,
-    activeIntervals: ACTIVE_INTERVALS,
-  });
-
-  const statusInterval = setInterval(() => {
-    const s = wsManager.getStatus();
-    logger.info("Status", {
-      wsConnected: s.wsConnected,
-      activeInstruments: s.activeInstruments,
-      candleBuckets: s.candleStats.activeBuckets,
-      pendingPersist: s.candleStats.pendingPersist,
-      droppedLateTicks: s.candleStats.droppedLateTicks,
-      wsHealthy: s.healthStatus.wsHealthy,
-      apiFallbackActive: s.healthStatus.apiFallbackActive,
-    });
-  }, 60_000);
+  const sids = new Map(universe.map((i) => [i.storeKey, i.sid]));
+  const spotKeys = new Set(universe.filter((i) => i.kind === "spot").map((i) => i.storeKey));
+  const sink = new LiveCandleSink(db, sids, undefined, spotKeys);
+  await sink.ensurePartitions(today);
+  const aggregator = new CandleAggregator(db, { activeIntervals: LIVE_INTERVALS, sink });
 
   let shuttingDown = false;
-  const shutdown = async (signal: string) => {
+  const shutdown = async (reason: string, code: number) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    logger.info("Shutting down", { signal });
-    clearInterval(statusInterval);
+    logger.info("Live stream stopping", { reason, ...stream.getStatus(), sink: sink.getStats() });
+    clearInterval(statusTimer);
+    clearTimeout(stopTimer);
     try {
-      await wsManager.stop(); // flushes open candles before the pool closes
+      await stream.stop(); // writes every open candle before the pool closes
       await closeDb();
-      process.exit(0);
     } catch (error) {
-      logger.error("Shutdown error", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-      process.exit(1);
+      logger.error("Shutdown error", { error: error instanceof Error ? error.message : String(error) });
+      code = 1;
     }
+    process.exit(code);
   };
-  process.on("SIGINT", () => void shutdown("SIGINT"));
-  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+  const stream = new LiveStream({
+    shards: [...plan.shards].map(([alias, instruments]) => ({
+      alias,
+      upstoxClient: clients.get(alias)!,
+      instruments,
+    })),
+    aggregator,
+    onAllDown: (ms) => void shutdown(`no connection for ${Math.round(ms / 60_000)} min`, 1),
+  });
+  stream.start();
+
+  const nowMin = istClock(Date.now()).minutes;
+  const stopInMs = Math.max(0, (stopMin - nowMin) * 60_000 - (Date.now() % 60_000));
+  const stopTimer = setTimeout(() => void shutdown(`stop time ${config.live.stopTime} IST`, 0), stopInMs);
+  const statusTimer = setInterval(
+    () => logger.info("Live status", { ...stream.getStatus(), sink: sink.getStats() }),
+    60_000,
+  );
+  logger.info("Live stream started", { stopsAt: config.live.stopTime, stopInMin: Math.round(stopInMs / 60_000) });
+
+  process.on("SIGINT", () => void shutdown("SIGINT", 0));
+  process.on("SIGTERM", () => void shutdown("SIGTERM", 0));
 }
 
 async function main(): Promise<void> {

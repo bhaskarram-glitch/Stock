@@ -1,6 +1,7 @@
 import { logger } from "../../lib/logger.js";
 import type {
   UpstoxMarketDataFeedAuthorizeResponse,
+  UpstoxMarketHoliday,
   UpstoxQuote,
   UpstoxQuoteResponse,
 } from "./types.js";
@@ -143,6 +144,27 @@ export class UpstoxClient {
       });
       return quote;
     }, `Upstox fetchQuote for ${instrumentKey}`);
+  }
+
+  /** Upstox market holidays for the current year (GET /v2/market/holidays). */
+  async fetchMarketHolidays(): Promise<UpstoxMarketHoliday[]> {
+    return this.retryWithBackoff(async () => {
+      const url = new URL("/v2/market/holidays", this.baseUrl);
+      const response = await fetch(url, { headers: this.authHeaders() });
+      if (!response.ok) {
+        throw new Error(
+          `Upstox holidays request failed with ${response.status} ${response.statusText}`,
+        );
+      }
+      const payload = (await response.json()) as {
+        status?: string;
+        data?: UpstoxMarketHoliday[];
+      };
+      if (payload.status !== "success" || !Array.isArray(payload.data)) {
+        throw new Error(`Upstox holidays returned status ${String(payload.status)}`);
+      }
+      return payload.data;
+    }, "Upstox market holidays");
   }
 
   async authorizeMarketDataFeed(): Promise<string> {

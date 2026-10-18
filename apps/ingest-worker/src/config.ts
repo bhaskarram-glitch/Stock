@@ -31,7 +31,19 @@ export type AppConfig = {
   upstoxBaseUrl: string;
   upstoxAccounts: UpstoxAccountRegistry;
   upstoxInstrumentKeys: string[];
+  live: LiveConfig;
 };
+
+/** Live streaming worker settings (WORKER_MODE=websocket-stream). Times are IST. */
+export interface LiveConfig {
+  /** Streams only between these times; outside them the worker exits 0. Defaults 08:50 / 15:45. */
+  startTime: string;
+  stopTime: string;
+  /** Upstox full-mode keys per account. Default 2000; lower it only for testing. */
+  keysPerAccount: number;
+  /** Limit to these index underlyings (CSV of symbols, e.g. NIFTY,SENSEX). Empty = all 9. */
+  symbols: string[];
+}
 
 const VALID_MODES: readonly WorkerMode[] = ["healthcheck", "websocket-stream"];
 const VALID_ROLES: readonly UpstoxAccountRole[] = ["ws", "hist", "trade"];
@@ -248,6 +260,27 @@ function buildRegistry(accounts: UpstoxAccount[]): UpstoxAccountRegistry {
   };
 }
 
+function readLiveConfig(env: NodeJS.ProcessEnv): LiveConfig {
+  const hhmm = (key: string, fallback: string) => {
+    const v = readOptional(env, key) ?? fallback;
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(v)) throw new Error(`${key} must be HH:MM (24h IST), got "${v}"`);
+    return v;
+  };
+  const keysRaw = readOptional(env, "LIVE_KEYS_PER_ACCOUNT");
+  const keysPerAccount = keysRaw === null ? 2000 : Number(keysRaw);
+  if (!Number.isInteger(keysPerAccount) || keysPerAccount < 1 || keysPerAccount > 2000) {
+    throw new Error(`LIVE_KEYS_PER_ACCOUNT must be 1..2000, got "${keysRaw}"`);
+  }
+  const live = {
+    startTime: hhmm("LIVE_START", "08:50"),
+    stopTime: hhmm("LIVE_STOP", "15:45"),
+    keysPerAccount,
+    symbols: readCsvList(env, "LIVE_SYMBOLS").map((s) => s.toUpperCase()),
+  };
+  if (live.startTime >= live.stopTime) throw new Error("LIVE_START must be before LIVE_STOP");
+  return live;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const upstoxAccounts = buildRegistry(readUpstoxAccounts(env));
 
@@ -258,5 +291,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       readOptional(env, "UPSTOX_BASE_URL") ?? DEFAULT_UPSTOX_BASE_URL,
     upstoxAccounts,
     upstoxInstrumentKeys: readCsvList(env, "UPSTOX_INSTRUMENT_KEYS"),
+    live: readLiveConfig(env),
   };
 }

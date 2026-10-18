@@ -1,0 +1,25 @@
+# infra/ops/systemd/stock-stream.service — live streaming worker (Phase 3). Installed by install.sh.
+# Started by stock-stream.timer (Mon–Fri 09:00 IST) and at boot. The worker itself exits 0 at
+# LIVE_STOP (15:45 IST), outside market hours, on weekends and on F&O holidays; it exits 1 when no
+# Upstox connection has been up for 10 min, and systemd restarts it. Alerts only when it gives up.
+#   sudo systemctl status stock-stream        journalctl -u stock-stream -f
+#   sudo systemctl restart stock-stream       (after a deploy; open candles are written first)
+[Unit]
+Description=Live market data stream (Upstox → live candles)
+Wants=docker.service
+After=docker.service network-online.target
+OnFailure=stock-notify-failure@%n.service
+StartLimitIntervalSec=1h
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=__STOCK_USER__
+ExecStart=/usr/local/bin/stock-job ingest-worker
+ExecStop=/usr/bin/docker stop -t 60 stock-stream
+Restart=on-failure
+RestartSec=30s
+TimeoutStopSec=90s
+
+[Install]
+WantedBy=multi-user.target

@@ -11,6 +11,8 @@ const ALL_INTERVALS: readonly CandleInterval[] = [
   "1d",
 ];
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+/** 09:15 IST = 03:45 UTC → hourly buckets start 45 min past each UTC hour. */
+const HOUR_ANCHOR_MS = 45 * 60_000;
 
 export interface CandleStats {
   activeBuckets: number;
@@ -29,6 +31,13 @@ export interface CandleData {
   close: number;
   volume: number;
   tick_count: number;
+  /** Open interest at the last tick of the bucket (F&O only). */
+  oi?: number;
+}
+
+/** Where closed candles go. Default: `market_candles` (see MarketCandleSink below). */
+export interface CandleSink {
+  persist(candles: CandleData[]): Promise<void>;
 }
 
 interface AggregatorState {
@@ -38,6 +47,7 @@ interface AggregatorState {
   close: number;
   volume: number;
   tick_count: number;
+  oi?: number;
   bucket_start_ms: number;
   last_update: Date;
 }
@@ -48,6 +58,8 @@ export interface CandleAggregatorOptions {
   flushIntervalMs?: number;
   /** Injectable wall clock (ms). Default Date.now. */
   now?: () => number;
+  /** Where closed candles are written. Default: market_candles via `db`. */
+  sink?: CandleSink;
 }
 
 export class CandleAggregator {
@@ -71,6 +83,8 @@ export class CandleAggregator {
   private pendingPersist = 0;
   private droppedLateTicks = 0;
 
+  private readonly sink: CandleSink | null;
+
   constructor(
     private readonly db: Db,
     options: CandleAggregatorOptions = {},
@@ -78,6 +92,7 @@ export class CandleAggregator {
     this.activeIntervals = options.activeIntervals ?? ["1m", "5m", "15m", "1h"];
     this.flushIntervalMs = options.flushIntervalMs ?? 5_000;
     this.now = options.now ?? Date.now;
+    this.sink = options.sink ?? null;
   }
 
   // ---------------------------------------------------------------------------
@@ -148,6 +163,7 @@ export class CandleAggregator {
     price: number,
     volumeDelta: number,
     timestamp: Date = new Date(this.now()),
+    oi?: number,
   ): Promise<void> {
     const closed: CandleData[] = [];
     for (const interval of this.activeIntervals) {
@@ -157,6 +173,7 @@ export class CandleAggregator {
         price,
         volumeDelta,
         timestamp,
+        oi,
       );
       if (c) closed.push(c);
     }
@@ -170,6 +187,7 @@ export class CandleAggregator {
     price: number,
     volumeDelta: number,
     timestamp: Date,
+    oi?: number,
   ): CandleData | undefined {
     const key = `${instrumentKey}:${interval}`;
     const intervalMs = this.intervalMs[interval];
@@ -185,7 +203,7 @@ export class CandleAggregator {
       (state && bucketStartMs < state.bucket_start_ms)
     ) {
       this.droppedLateTicks += 1;
-      logger.warn("Dropped late tick for closed bucket", {
+      logger.debug("Dropped late tick for closed bucket", {
         instrumentKey,
         interval,
         tickBucket: new Date(bucketStartMs).toISOString(),
@@ -202,6 +220,7 @@ export class CandleAggregator {
         close: price,
         volume: volumeDelta,
         tick_count: 1,
+        oi,
         bucket_start_ms: bucketStartMs,
         last_update: timestamp,
       };
@@ -212,6 +231,7 @@ export class CandleAggregator {
       state.close = price;
       state.volume += volumeDelta;
       state.tick_count += 1;
+      if (oi !== undefined) state.oi = oi;
       state.last_update = timestamp;
     }
 
@@ -243,6 +263,7 @@ export class CandleAggregator {
       close: state.close,
       volume: state.volume,
       tick_count: state.tick_count,
+      ...(state.oi !== undefined ? { oi: state.oi } : {}),
     };
   }
 
@@ -313,6 +334,17 @@ export class CandleAggregator {
   }
 
   private async persistCandles(candles: CandleData[]): Promise<void> {
+    if (this.sink) {
+      try {
+        await this.sink.persist(candles);
+      } catch (error) {
+        logger.error("Failed to save candles", {
+          count: candles.length,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      return;
+    }
     const unresolved = await this.preloadInstrumentIds(
       Array.from(new Set(candles.map((c) => c.instrument_key))),
     );
@@ -358,7 +390,11 @@ export class CandleAggregator {
   // Helpers
   // ---------------------------------------------------------------------------
 
-  /** Bucket start in epoch ms. Intraday intervals align to UTC (divides evenly); 1d aligns to IST midnight. */
+  /**
+   * Bucket start in epoch ms. 1m/5m/15m align to the clock (IST is UTC+5:30, so 15m buckets fall on
+   * IST :00/:15/:30/:45). 1h aligns to the 09:15 IST market open (09:15, 10:15, … 15:15) like
+   * exchange/broker charts — a UTC-aligned hour would start at IST :30. 1d aligns to IST midnight.
+   */
   private getBucketStartMs(
     timestampMs: number,
     interval: CandleInterval,
@@ -368,7 +404,8 @@ export class CandleAggregator {
       const shifted = timestampMs + IST_OFFSET_MS;
       return Math.floor(shifted / intervalMs) * intervalMs - IST_OFFSET_MS;
     }
-    return Math.floor(timestampMs / intervalMs) * intervalMs;
+    const anchor = interval === "1h" ? HOUR_ANCHOR_MS : 0;
+    return Math.floor((timestampMs - anchor) / intervalMs) * intervalMs + anchor;
   }
 
   private parseKey(

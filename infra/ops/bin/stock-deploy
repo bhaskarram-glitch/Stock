@@ -2,7 +2,7 @@
 # infra/ops/bin/stock-deploy — update the server to the latest pushed code (run as the app user):
 #   1. fast-forward /opt/stock to origin/main (refuses if the server copy has local edits)
 #   2. rebuild the app image, apply pending migrations
-#   3. restart the streaming worker if it is running
+#   3. remove any old `up -d` style worker container; tell you to restart a running live stream
 #   4. if infra/ops changed, tell you to re-run the installer (needs sudo)
 set -euo pipefail
 # shellcheck source=stock-common.sh
@@ -21,10 +21,12 @@ echo "code: ${before:0:7} → ${after:0:7}"
 docker compose -f "$COMPOSE_FILE" build
 "$(dirname "$(readlink -f "$0")")/stock-job" migrate
 
-running="$(docker compose -f "$COMPOSE_FILE" ps --status running --services)"
-if grep -qx ingest-worker <<<"$running"; then
-  docker compose -f "$COMPOSE_FILE" up -d ingest-worker
-  echo "ingest-worker restarted on the new image"
+# Streaming is owned by systemd (stock-stream.service). A worker started the old way (`up -d`)
+# would stream a second copy with old code, so remove it.
+docker compose -f "$COMPOSE_FILE" rm -sf ingest-worker >/dev/null 2>&1 || true
+if systemctl is-active --quiet stock-stream.service; then
+  echo "live stream is running on the OLD image. Restart it when convenient (open candles are written first):"
+  echo "  sudo systemctl restart stock-stream"
 fi
 
 if [ "$before" != "$after" ] && ! git diff --quiet "$before" "$after" -- infra/ops; then
