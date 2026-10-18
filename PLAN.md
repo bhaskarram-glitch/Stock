@@ -180,18 +180,20 @@ Access = Tailscale only (`ssh stock-prod`); no public inbound ports.
 
 ## Phase 3 — Live streaming, unattended (was Phase 4; moved ahead of analysis 2026-10-16)
 
-- [ ] Worker auth via Analytics Token from account registry (WS role accounts)
-- [ ] Persist 1h candles only (aggregate 1m→1h in memory); 1m/5m optional later
-- [ ] Exit non-zero on reconnect exhaustion or capped infinite backoff (Bug #8)
-- [ ] Real heartbeat: pong timeout + `heartbeat_ts` (Bug #12)
-- [ ] Market calendar: `/v2/market/holidays`, `/v2/market/timings`, WS `market_info`
-- [ ] Telegram alerts: worker death, auth failure, backfill failures, data gaps
+Scope (decided 2026-10-16/18): the 9 index spots + every still-trading future and option of the 9 F&O indices (~10,600 instruments, 2026-10-14) in Upstox `full` mode (price, volume, OI).
+Upstox limits (docs, checked 2026-10-16): **per account** — 2,000 instrument keys in `full` mode, 5 connections on Plus (lower combined limits when modes are mixed). 5 accounts = 10,000 → a **6th Upstox Plus account** will be added (12,000 capacity).
+Granularity: 1m + 5m / 15m / 60m candles. 15m and 60m kept permanently; how long 1m and 5m are kept is decided after the measuring day (3.5). Minute history is re-fetchable from Upstox, so live 1m/5m need not be kept forever.
+
+- [x] Worker auth via Analytics Token from the account registry (`ws` role)
 - [x] Host: Oracle VM via docker compose (Phase H)
-- [ ] Performance: debug-level tick logs (Perf #5) — Perf #1/#2/#3/#4 done in Phase 0
-- [ ] Shard keys across connections and across accounts (5 conn/account on Plus)
-- [ ] Use Upstox `I1` 1m OHLC from full-mode feed if present for F&O; roll up 5m/15m locally
-- [ ] API fallback persists candles with `source: 'api'` (Bug #6)
-- [ ] EOD reconciliation: live candles vs intraday API
+- [ ] 6th Upstox Plus account + Analytics Token → `UPSTOX_ACCOUNT_6_*` on the server; `check-accounts` green (user)
+- [ ] 3.1 Universe + sharding: 9 spots + all still-trading index futures/options, read from `instruments` and refreshed daily after the 08:00 sync; split across `ws` accounts, ≤ 2,000 keys each; if over capacity, drop the farthest expiries first and log what was left out
+- [ ] 3.2 Streaming worker: one connection per account, `full` mode, resubscribe after reconnect; capped exponential backoff that never gives up silently (Bug #8); pong-timeout heartbeat + `heartbeat_ts` (Bug #12); candles stored under the permanent contract keys; use the feed's own 1m OHLC (`I1`) where present; debug-level tick logs (Perf #5)
+- [ ] 3.3 Intraday storage: compact candle table partitioned by day (integer instrument ids, no per-row uuid/text key) for 1m/5m/15m/60m; one batched write per minute; nightly backup leaves out 1m/5m
+- [ ] 3.4 Market-hours lifecycle: start 09:00, stop 15:45 IST Mon–Fri via systemd; skip exchange holidays (Upstox holidays API); flush open candles on stop
+- [ ] 3.5 Measuring day: one full session; record rows/day, GB/day, CPU, memory, ticks/s → decide 1m/5m retention
+- [ ] 3.6 Alerts: worker exited during market hours, an account disconnected > 2 min, no ticks for 5 min; daily status gains live-feed figures
+- [ ] 3.7 End-of-day reconciliation vs Upstox 1-minute history; gaps filled from history and marked `source = 'api'` (Bug #6)
 
 ---
 
