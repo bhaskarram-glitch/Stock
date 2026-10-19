@@ -16,7 +16,9 @@ StartLimitBurst=6
 Type=simple
 User=__STOCK_USER__
 ExecStart=/usr/local/bin/stock-job ingest-worker
-ExecStop=/usr/bin/docker stop -t 60 stock-stream
+# "-": when the worker already exited by itself (15:45, weekend, holiday) the container is gone and
+# docker stop fails — that must not mark the run as failed (it caused a restart loop on 2026-10-19).
+ExecStop=-/usr/bin/docker stop -t 60 stock-stream
 Restart=on-failure
 RestartSec=30s
 TimeoutStopSec=90s
