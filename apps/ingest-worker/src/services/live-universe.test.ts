@@ -32,6 +32,20 @@ describe("planShards", () => {
     for (const s of plan.shards.values()) expect(s.length).toBeLessThanOrEqual(2);
   });
 
+  it("keeps recently traded options ahead of never-traded nearer ones", () => {
+    const plan = planShards(
+      [
+        inst("near-dead", "option", "2026-10-20"),
+        { ...inst("far-liquid", "option", "2027-12-28"), recentlyTraded: true },
+        inst("spot", "spot", null),
+      ],
+      ["a"],
+      2,
+    );
+    expect(plan.shards.get("a")!.map((i) => i.feedKey)).toEqual(["spot", "far-liquid"]);
+    expect(plan.dropped.map((d) => d.feedKey)).toEqual(["near-dead"]);
+  });
+
   it("needs at least one account", () => {
     expect(() => planShards(universe, [])).toThrow();
   });
@@ -40,6 +54,7 @@ describe("planShards", () => {
     const plan = planShards(universe, ["a"], 2);
     expect(describeDropped(plan.dropped)).toEqual({
       dropped: 3,
+      recentlyTraded: 0,
       kinds: { spot: 0, future: 0, option: 3 },
       expiriesFrom: "2026-10-20",
       expiriesTo: "2026-12-31",

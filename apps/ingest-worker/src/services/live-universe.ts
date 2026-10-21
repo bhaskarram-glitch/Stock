@@ -5,8 +5,9 @@
  * of those underlyings, read from `instruments` at start-up (so it follows the 08:00 instrument sync).
  *
  * Upstox limits are PER ACCOUNT: 2,000 instrument keys in `full` mode (docs, checked 2026-10-16).
- * If the universe is bigger than accounts × 2,000, the farthest expiries are left out first and
- * the worker logs exactly what it left out. Each account gets one connection with its share.
+ * If the universe is bigger than accounts × 2,000, contracts that have not traded recently are left
+ * out first (farthest expiry first) — day 1 showed long-dated NIFTY options with real volume being
+ * dropped while never-traded near strikes were streamed — and the worker logs what it left out. Each account gets one connection with its share.
  */
 import type { Db } from "../lib/db.js";
 import type { ResolvedUnderlying } from "../providers/upstox/indices.js";
@@ -30,6 +31,8 @@ export interface LiveInstrument {
   kind: LiveKind;
   underlyingKey: string;
   expiry: string | null;
+  /** traded in the last ~2 weeks (daily candles with volume > 0) — kept first when over capacity */
+  recentlyTraded?: boolean;
 }
 
 export async function loadLiveUniverse(
@@ -60,7 +63,24 @@ export async function loadLiveUniverse(
       expiry: row.expiry,
     }];
   });
+  const traded = await recentlyTradedKeys(db, derivatives.map((d) => d.storeKey), today);
+  for (const d of derivatives) d.recentlyTraded = traded.has(d.storeKey);
   return [...spots, ...derivatives];
+}
+
+/** Keys with at least one daily candle with volume > 0 in the 14 days before `today`. */
+async function recentlyTradedKeys(db: Db, keys: string[], today: string): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (let i = 0; i < keys.length; i += 2000) {
+    const { rows } = await db.query<{ instrument_key: string }>(
+      `select distinct instrument_key from market_candles
+        where instrument_key = any($1::text[]) and interval = '1d' and volume > 0
+          and bucket_start >= ($2::date - 14)::timestamp at time zone 'Asia/Kolkata'`,
+      [keys.slice(i, i + 2000), today],
+    );
+    for (const r of rows) out.add(r.instrument_key);
+  }
+  return out;
 }
 
 export interface ShardPlan {
@@ -74,7 +94,8 @@ export interface ShardPlan {
 const KIND_ORDER: Record<LiveKind, number> = { spot: 0, future: 1, option: 2 };
 
 /**
- * Keeps spots, then futures, then options by nearest expiry, up to accounts × perAccount, and deals
+ * Keeps spots, then futures, then options that traded recently, then the rest — each by nearest
+ * expiry — up to accounts × perAccount, and deals
  * them out round-robin so every account carries a similar mix (and a similar tick load).
  */
 export function planShards(
@@ -90,6 +111,7 @@ export function planShards(
     .sort(
       (a, b) =>
         KIND_ORDER[a.kind] - KIND_ORDER[b.kind] ||
+        Number(!a.recentlyTraded) - Number(!b.recentlyTraded) ||
         (a.expiry ?? "").localeCompare(b.expiry ?? "") ||
         a.underlyingKey.localeCompare(b.underlyingKey) ||
         a.feedKey.localeCompare(b.feedKey),
@@ -107,6 +129,7 @@ export function describeDropped(dropped: LiveInstrument[]): Record<string, unkno
   const expiries = dropped.map((d) => d.expiry ?? "").filter(Boolean).sort();
   return {
     dropped: dropped.length,
+    recentlyTraded: dropped.filter((d) => d.recentlyTraded).length,
     kinds: Object.fromEntries(
       (["spot", "future", "option"] as const).map((k) => [k, dropped.filter((d) => d.kind === k).length]),
     ),

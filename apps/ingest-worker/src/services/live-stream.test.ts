@@ -42,6 +42,22 @@ describe("TickFilter", () => {
     expect(f.accept(tick("K", 99, "2026-10-19T03:46:30Z"))).toBeNull();
   });
 
+  it("uses a first tick that is a trade made after the stream started", () => {
+    const start = Date.parse("2026-10-19T03:30:00Z"); // 09:00 IST
+    const f = new TickFilter({ startMs: start, countFirstTradeVolume: true });
+    expect(f.accept(tick("OLD", 100, "2026-10-16T09:59:00Z", 500))).toBeNull(); // snapshot of an old trade
+    expect(f.accept(tick("NEW", 12.5, "2026-10-19T05:01:02Z", 65, 65))).toEqual({
+      price: 12.5, volumeDelta: 65, timestamp: new Date("2026-10-19T05:01:02Z"), oi: 65,
+    });
+    expect(f.firstTrades).toBe(1);
+    expect(f.accept(tick("NEW", 13, "2026-10-19T05:02:00Z", 130))).toMatchObject({ volumeDelta: 65 });
+  });
+
+  it("does not count a first trade's cumulative volume after a mid-day restart", () => {
+    const f = new TickFilter({ startMs: Date.parse("2026-10-19T06:00:00Z"), countFirstTradeVolume: false });
+    expect(f.accept(tick("K", 50, "2026-10-19T06:00:05Z", 5000))).toMatchObject({ volumeDelta: 0 });
+  });
+
   it("rejects ticks without a price or time", () => {
     const f = new TickFilter();
     expect(f.accept({ instrument_token: "K" })).toBeNull();

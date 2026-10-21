@@ -15,6 +15,7 @@ import { LiveStream } from "./services/live-stream.js";
 import { describeDropped, loadLiveUniverse, planShards } from "./services/live-universe.js";
 
 const LIVE_INTERVALS: CandleInterval[] = ["1m", "5m", "15m", "1h"];
+const MARKET_OPEN_MIN = 9 * 60 + 15; // 09:15 IST
 
 /** Verifies config + DB reachability. Exit code is the signal; used by supervisors and CI. */
 async function runHealthcheck(
@@ -94,7 +95,8 @@ async function runWebsocketStream(config: ReturnType<typeof loadConfig>): Promis
   const spotKeys = new Set(universe.filter((i) => i.kind === "spot").map((i) => i.storeKey));
   const sink = new LiveCandleSink(db, sids, undefined, spotKeys);
   await sink.ensurePartitions(today);
-  const aggregator = new CandleAggregator(db, { activeIntervals: LIVE_INTERVALS, sink });
+  const aggregator = new CandleAggregator(db, { activeIntervals: LIVE_INTERVALS, sink, closeGraceMs: 3_000 });
+  const startMs = Date.now();
 
   let shuttingDown = false;
   const shutdown = async (reason: string, code: number) => {
@@ -120,6 +122,8 @@ async function runWebsocketStream(config: ReturnType<typeof loadConfig>): Promis
       instruments,
     })),
     aggregator,
+    // started before the 09:15 open → a contract's first trade today carries all of today's volume
+    tickFilter: { startMs, countFirstTradeVolume: istClock(startMs).minutes < MARKET_OPEN_MIN },
     onAllDown: (ms) => void shutdown(`no connection for ${Math.round(ms / 60_000)} min`, 1),
   });
   stream.start();

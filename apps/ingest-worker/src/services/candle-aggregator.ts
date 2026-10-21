@@ -60,6 +60,12 @@ export interface CandleAggregatorOptions {
   now?: () => number;
   /** Where closed candles are written. Default: market_candles via `db`. */
   sink?: CandleSink;
+  /**
+   * Keep a bucket open this long after its window ends, so a trade delivered a moment late (network,
+   * exchange timestamp vs server clock) still lands in its own minute instead of being dropped.
+   * Default 0. The live worker uses 3s (day 1: 383 late ticks dropped with 0).
+   */
+  closeGraceMs?: number;
 }
 
 export class CandleAggregator {
@@ -77,6 +83,7 @@ export class CandleAggregator {
 
   private activeIntervals: CandleInterval[];
   private readonly flushIntervalMs: number;
+  private readonly closeGraceMs: number;
   private readonly now: () => number;
   private flushTimer?: NodeJS.Timeout;
   private persistChain: Promise<void> = Promise.resolve();
@@ -91,6 +98,7 @@ export class CandleAggregator {
   ) {
     this.activeIntervals = options.activeIntervals ?? ["1m", "5m", "15m", "1h"];
     this.flushIntervalMs = options.flushIntervalMs ?? 5_000;
+    this.closeGraceMs = options.closeGraceMs ?? 0;
     this.now = options.now ?? Date.now;
     this.sink = options.sink ?? null;
   }
@@ -236,7 +244,7 @@ export class CandleAggregator {
     }
 
     // Wall-clock close: bucket window has already ended.
-    if (this.now() >= bucketStartMs + intervalMs) {
+    if (this.now() >= bucketStartMs + intervalMs + this.closeGraceMs) {
       const c = this.closeBucket(key, instrumentKey, interval, state);
       // If the previous branch also closed one, persist both.
       if (closed) this.enqueuePersist([closed]);
@@ -279,7 +287,7 @@ export class CandleAggregator {
       const parsed = this.parseKey(key);
       if (!parsed) continue;
       const end = state.bucket_start_ms + this.intervalMs[parsed.interval];
-      if (now >= end) {
+      if (now >= end + this.closeGraceMs) {
         closed.push(
           this.closeBucket(key, parsed.instrumentKey, parsed.interval, state),
         );

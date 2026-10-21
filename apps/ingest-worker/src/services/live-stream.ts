@@ -35,12 +35,36 @@ export interface AcceptedTick {
   oi?: number;
 }
 
+export interface TickFilterOptions {
+  /**
+   * When the stream started. A first tick whose last-trade time is at/after this is a trade made
+   * while we were connected (typically a contract that had never traded, so Upstox sent no snapshot
+   * at subscribe) — it is used, not swallowed as a baseline. Day 1: 20+ single-trade contracts lost.
+   * Default: never (every first tick is a baseline).
+   */
+  startMs?: number;
+  /**
+   * Count the cumulative volume of such a first trade (true when the stream started before the
+   * market opened, so all of today's volume happened while connected). After a mid-day restart it
+   * would double-count earlier volume, so it counts 0 then.
+   */
+  countFirstTradeVolume?: boolean;
+}
+
 export class TickFilter {
   private readonly last = new Map<string, LastSeen>();
   private readonly volume = new CumulativeVolumeTracker();
+  private readonly startMs: number;
+  private readonly countFirstTradeVolume: boolean;
   baselines = 0;
+  firstTrades = 0;
   duplicates = 0;
   accepted = 0;
+
+  constructor(options: TickFilterOptions = {}) {
+    this.startMs = options.startMs ?? Infinity;
+    this.countFirstTradeVolume = options.countFirstTradeVolume ?? false;
+  }
 
   /** Returns what to feed the aggregator, or null when the tick is not a new trade. */
   accept(tick: UpstoxWSTick): AcceptedTick | null {
@@ -56,8 +80,19 @@ export class TickFilter {
     if (!prev) {
       this.last.set(key, { ltt, price, oi });
       this.volume.delta(key, tick.volume);
-      this.baselines += 1;
-      return null;
+      if (ltt < this.startMs) {
+        this.baselines += 1;
+        return null;
+      }
+      this.firstTrades += 1;
+      this.accepted += 1;
+      const v = tick.volume;
+      return {
+        price,
+        volumeDelta: this.countFirstTradeVolume && v !== undefined && Number.isFinite(v) && v > 0 ? v : 0,
+        timestamp: new Date(ltt),
+        oi,
+      };
     }
     if (oi !== undefined) prev.oi = oi;
     if (ltt === prev.ltt && price === prev.price) {
@@ -101,6 +136,8 @@ export interface LiveStreamOptions {
   socketFactory?: (url: string) => UpstoxWebSocketLike;
   /** How often the watchdog looks. Default 15s. */
   watchdogIntervalMs?: number;
+  /** See TickFilterOptions. */
+  tickFilter?: TickFilterOptions;
 }
 
 interface ShardState {
@@ -113,7 +150,7 @@ interface ShardState {
 
 export class LiveStream {
   private readonly byFeedKey = new Map<string, LiveInstrument>();
-  private readonly filter = new TickFilter();
+  private readonly filter: TickFilter;
   private readonly states: ShardState[] = [];
   private readonly now: () => number;
   private readonly allDownLimitMs: number;
@@ -128,6 +165,7 @@ export class LiveStream {
   constructor(private readonly options: LiveStreamOptions) {
     this.now = options.now ?? Date.now;
     this.allDownLimitMs = options.allDownLimitMs ?? 10 * 60_000;
+    this.filter = new TickFilter(options.tickFilter);
     this.lastAnyUpMs = this.now();
     for (const shard of options.shards) {
       for (const inst of shard.instruments) this.byFeedKey.set(inst.feedKey, inst);
@@ -220,6 +258,7 @@ export class LiveStream {
       ),
       instrumentsSeen: this.filter.size(),
       trades: this.filter.accepted,
+      firstTrades: this.filter.firstTrades,
       duplicates: this.filter.duplicates,
       unknownTicks: this.unknownTicks,
       openBuckets: agg.activeBuckets,

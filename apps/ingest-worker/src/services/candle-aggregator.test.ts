@@ -222,4 +222,22 @@ describe("CandleAggregator", () => {
     expect(start("1h")).toBe(new Date("2026-10-19T10:15:00+05:30").toISOString());
     expect(start("15m")).toBe(new Date("2026-10-19T10:15:00+05:30").toISOString());
   });
+
+  it("keeps a bucket open for the close grace so a slightly late trade still counts", async () => {
+    const saved: CandleData[] = [];
+    let now = Date.parse("2026-10-19T09:16:01+05:30");
+    const agg = new CandleAggregator({} as never, {
+      activeIntervals: ["1m"],
+      now: () => now,
+      closeGraceMs: 3000,
+      sink: { persist: async (c) => void saved.push(...c) },
+    });
+    await agg.processTick("K", 100, 1, new Date("2026-10-19T09:15:30+05:30"));
+    await agg.flushExpiredBuckets(); // 1s after the minute: still open
+    await agg.processTick("K", 101, 1, new Date("2026-10-19T09:15:59.900+05:30")); // delivered late
+    expect(agg.getStats().droppedLateTicks).toBe(0);
+    now = Date.parse("2026-10-19T09:16:03+05:30");
+    await agg.flushExpiredBuckets();
+    expect(saved).toEqual([expect.objectContaining({ close: 101, volume: 2 })]);
+  });
 });
