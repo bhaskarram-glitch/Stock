@@ -246,7 +246,10 @@ function normalizeFeedTick(
     new Date().toISOString();
 
   const lastPrice = asNumber(ltpc?.ltp) ?? asNumber(ohlc?.close);
-  if (lastPrice === undefined) return null;
+  const greeks = marketFullFeed?.optionGreeks ?? feed.firstLevelWithGreeks?.optionGreeks;
+  const oi = asNumber(marketFullFeed?.oi) ?? asNumber(feed.firstLevelWithGreeks?.oi);
+  // A never-traded contract has no price but can still carry quotes/OI (used by 5-min snapshots).
+  if (lastPrice === undefined && depth === undefined && oi === undefined) return null;
 
   const cumulativeVolume =
     asNumber(marketFullFeed?.vtt) ?? asNumber(feed.firstLevelWithGreeks?.vtt);
@@ -259,6 +262,18 @@ function normalizeFeedTick(
     prev_close: asNumber(ltpc?.cp),
     bid: asNumber(depth?.bidP),
     ask: asNumber(depth?.askP),
+    bid_qty: asNumber(depth?.bidQ),
+    ask_qty: asNumber(depth?.askQ),
+    atp: asNumber(marketFullFeed?.atp),
+    iv: asNumber(marketFullFeed?.iv) ?? asNumber(feed.firstLevelWithGreeks?.iv),
+    greeks: greeks
+      ? {
+          delta: asNumber(greeks.delta),
+          gamma: asNumber(greeks.gamma),
+          theta: asNumber(greeks.theta),
+          vega: asNumber(greeks.vega),
+        }
+      : undefined,
     request_mode: feed.requestMode,
     feed_type: feedType,
     market_data: {
@@ -267,8 +282,7 @@ function normalizeFeedTick(
       vol_traded_today: cumulativeVolume,
       total_buy_qty: asNumber(marketFullFeed?.tbq),
       total_sell_qty: asNumber(marketFullFeed?.tsq),
-      oi:
-        asNumber(marketFullFeed?.oi) ?? asNumber(feed.firstLevelWithGreeks?.oi),
+      oi,
     },
     ohlc: ohlc
       ? {

@@ -83,6 +83,30 @@ function todayIst(): string {
   return new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
 }
 
+/**
+ * Upstox sometimes publishes a contract's daily candle a few days late (seen 2026-10-22: NIFTY FUT
+ * 29 DEC 26 had no 20/21 Oct candle on 22 Oct while other contracts did). Every run therefore
+ * re-asks for the last LATE_CANDLE_LOOKBACK_DAYS too — same single request per instrument, just a
+ * wider range; candles are upserted, so nothing is duplicated.
+ */
+export const LATE_CANDLE_LOOKBACK_DAYS = 7;
+
+/** First date to request: the day after the watermark, but never later than today − lookback. */
+export function resumeFrom(lastDate: string | null | undefined, floor: string, today: string): string {
+  if (!lastDate) return floor;
+  const next = addDays(lastDate, 1);
+  const lookback = addDays(today, -LATE_CANDLE_LOOKBACK_DAYS);
+  const from = next < lookback ? next : lookback;
+  return from < floor ? floor : from;
+}
+
+/** Watermark never moves backwards (a lookback re-fetch may return only older candles). */
+export function newerDate(a: string | null | undefined, b: string | null | undefined): string | null {
+  if (!a) return b ?? null;
+  if (!b) return a;
+  return a > b ? a : b;
+}
+
 function addDays(date: string, days: number): string {
   const d = new Date(`${date}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + days);
@@ -337,7 +361,7 @@ async function backfillSpot(
   for (const u of underlyings) {
     const state = states.get(u.instrumentKey);
     if (state?.is_final) continue; // marked unsupported by Upstox (see markUnsupported)
-    const from = state?.last_date ? addDays(state.last_date, 1) : args.from;
+    const from = resumeFrom(state?.last_date, args.from, today);
     if (from > today) {
       logger.info("Spot up to date", {
         symbol: u.symbol,
@@ -362,7 +386,7 @@ async function backfillSpot(
       );
       await saveState(db, u.instrumentKey, {
         first_date: state?.first_date ?? args.from,
-        last_date: lastCandleDate(candles) ?? state?.last_date ?? null,
+        last_date: newerDate(lastCandleDate(candles), state?.last_date),
         rows_written: (state?.rows_written ?? 0) + written,
         last_error: null,
       });
@@ -552,8 +576,10 @@ async function backfillContracts(
           });
           continue;
         }
-        const from = state?.last_date ? addDays(state.last_date, 1) : args.from;
-        if (from > c.expiry) {
+        const today = todayIst();
+        const resume = resumeFrom(state?.last_date, args.from, today);
+        const from = resume < c.expiry ? resume : c.expiry;
+        if (state?.last_date && state.last_date >= c.expiry) {
           await saveState(db, c.instrument_key, { is_final: true });
           skipped += 1;
           continue;
@@ -577,13 +603,15 @@ async function backfillContracts(
           );
           rows += written;
           loaded += 1;
-          // Final only once the expiry day is over; on/before it, more candles can still arrive.
-          const final = c.expiry < todayIst();
+          // Final once the expiry-day candle is in, or LATE_CANDLE_LOOKBACK_DAYS after expiry
+          // (never-traded contracts have no expiry-day candle). Until then late candles can arrive.
+          const lastDate = newerDate(lastCandleDate(candles), state?.last_date);
+          const final =
+            (lastDate !== null && lastDate >= c.expiry) ||
+            c.expiry < addDays(today, -LATE_CANDLE_LOOKBACK_DAYS);
           await saveState(db, c.instrument_key, {
             first_date: state?.first_date ?? args.from,
-            last_date: final
-              ? c.expiry
-              : (lastCandleDate(candles) ?? state?.last_date ?? null),
+            last_date: final ? c.expiry : lastDate,
             is_final: final,
             rows_written: (state?.rows_written ?? 0) + written,
             last_error: null,
@@ -682,7 +710,7 @@ export async function backfillActive(
     }
     processed += 1;
     const state = states.get(key);
-    const from = state?.last_date ? addDays(state.last_date, 1) : args.from;
+    const from = resumeFrom(state?.last_date, args.from, today);
     const instrumentId = idByKey.get(key);
     if (state?.is_final || from > today || !instrumentId) {
       if (!instrumentId) logger.error("Active contract missing after upsert", { key });
@@ -703,7 +731,7 @@ export async function backfillActive(
       fetched += 1;
       await saveState(db, key, {
         first_date: state?.first_date ?? args.from,
-        last_date: lastCandleDate(candles) ?? state?.last_date ?? null,
+        last_date: newerDate(lastCandleDate(candles), state?.last_date),
         rows_written: (state?.rows_written ?? 0) + written,
         last_error: null,
       });

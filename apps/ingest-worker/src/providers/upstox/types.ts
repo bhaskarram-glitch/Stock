@@ -42,6 +42,13 @@ export type UpstoxWSTick = {
   prev_close?: number;
   bid?: number;
   ask?: number;
+  bid_qty?: number;
+  ask_qty?: number;
+  /** average traded price today */
+  atp?: number;
+  /** implied volatility as sent by Upstox (options) */
+  iv?: number;
+  greeks?: { delta?: number; gamma?: number; theta?: number; vega?: number };
   request_mode?: string;
   feed_type?: string;
   market_data?: {

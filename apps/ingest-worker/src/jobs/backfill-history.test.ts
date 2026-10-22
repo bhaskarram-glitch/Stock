@@ -5,7 +5,7 @@ vi.mock("../lib/logger.js", () => ({
 }));
 
 import { UpstoxApiError } from "../providers/upstox/historical.js";
-import { canonicalContractKey, lastCandleDate, settleBseExpiryClose } from "./backfill-history.js";
+import { canonicalContractKey, lastCandleDate, newerDate, resumeFrom, settleBseExpiryClose } from "./backfill-history.js";
 
 const candle = (ts: string) => ({ ts, open: 1, high: 1, low: 1, close: 1, volume: 0, oi: null });
 
@@ -75,5 +75,20 @@ describe("UpstoxApiError.isUnsupportedKey", () => {
     expect(new UpstoxApiError("Instrument key is of invalid format", 400, "UDAPI1021", null).isUnsupportedKey).toBe(true);
     expect(new UpstoxApiError("rate limited", 429, null, 1000).isUnsupportedKey).toBe(false);
     expect(new UpstoxApiError("plus needed", 403, "UDAPI1149", null).isUnsupportedKey).toBe(false);
+  });
+});
+
+describe("resumeFrom / newerDate (late-published candles)", () => {
+  it("re-asks the last 7 days so a late candle is still picked up", () => {
+    expect(resumeFrom("2026-10-21", "2024-10-03", "2026-10-22")).toBe("2026-10-15");
+    expect(resumeFrom("2026-09-01", "2024-10-03", "2026-10-22")).toBe("2026-09-02"); // far behind: resume normally
+    expect(resumeFrom(null, "2024-10-03", "2026-10-22")).toBe("2024-10-03");
+    expect(resumeFrom("2024-10-03", "2024-10-03", "2024-10-05")).toBe("2024-10-03"); // never before the floor
+  });
+
+  it("never moves the watermark backwards", () => {
+    expect(newerDate("2026-10-19", "2026-10-21")).toBe("2026-10-21");
+    expect(newerDate(null, "2026-10-21")).toBe("2026-10-21");
+    expect(newerDate("2026-10-22", undefined)).toBe("2026-10-22");
   });
 });

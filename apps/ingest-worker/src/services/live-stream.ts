@@ -20,6 +20,7 @@ import {
 } from "../providers/upstox/websocket-client.js";
 import type { CandleAggregator } from "./candle-aggregator.js";
 import type { LiveInstrument } from "./live-universe.js";
+import { SnapshotBook } from "./live-snapshots.js";
 import { CumulativeVolumeTracker } from "./volume-tracker.js";
 
 interface LastSeen {
@@ -151,6 +152,8 @@ interface ShardState {
 export class LiveStream {
   private readonly byFeedKey = new Map<string, LiveInstrument>();
   private readonly filter: TickFilter;
+  /** latest state per instrument, for the 5-minute snapshots */
+  readonly snapshots = new SnapshotBook();
   private readonly states: ShardState[] = [];
   private readonly now: () => number;
   private readonly allDownLimitMs: number;
@@ -219,6 +222,7 @@ export class LiveStream {
       this.unknownTicks += 1;
       return;
     }
+    this.snapshots.update(inst.sid, tick);
     if (inst.kind === "future" && this.now() >= this.sampleDueMs) {
       this.sampleDueMs = this.now() + 60_000;
       logger.info("Feed sample", {

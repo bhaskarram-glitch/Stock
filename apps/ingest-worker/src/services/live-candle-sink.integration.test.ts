@@ -13,6 +13,7 @@ vi.mock("../lib/logger.js", () => ({
 import { createDb, type ClosableDb } from "../lib/db.js";
 import type { CandleData } from "./candle-aggregator.js";
 import { LiveCandleSink } from "./live-candle-sink.js";
+import { LiveSnapshotWriter, SnapshotBook } from "./live-snapshots.js";
 
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL ?? ownerUrl;
@@ -28,7 +29,7 @@ const candle = (interval: CandleData["interval"], ist: string, o: Partial<Candle
 });
 
 async function dropTestPartitions(db: ClosableDb) {
-  await db.query("drop table if exists live_candles_fine_20991230, live_candles_209912");
+  await db.query("drop table if exists live_candles_fine_20991230, live_candles_209912, live_snapshots_209912");
 }
 
 describe.skipIf(!ownerUrl)("LiveCandleSink (Postgres)", () => {
@@ -96,5 +97,26 @@ describe.skipIf(!ownerUrl)("LiveCandleSink (Postgres)", () => {
       [SID, `${DAY}T10:00:00+05:30`],
     );
     expect(rows).toEqual([{ high: 103, low: 99, close: 102, volume: 3 }]);
+  });
+
+  it("writes 5-minute snapshots (as the app role) and overwrites the same mark on a restart", async () => {
+    const sink = new LiveCandleSink(app, new Map(), []);
+    const writer = new LiveSnapshotWriter(app, (d) => sink.ensurePartitions(d), []);
+    const book = new SnapshotBook();
+    const ts = new Date(`${DAY}T10:05:00+05:30`);
+    book.update(SID, { instrument_token: "K", last_price: 101.5, volume: 1300, market_data: { oi: 65000, ltt: `${DAY}T04:34:58.000Z` },
+      bid: 101.45, bid_qty: 650, ask: 101.6, ask_qty: 325, atp: 99.8, iv: 13.75, greeks: { delta: -0.31, gamma: 0.0012, theta: -8.4, vega: 10.9 } });
+    await writer.write(book.take(ts), DAY);
+    book.update(SID, { instrument_token: "K", market_data: { oi: 70000 } });
+    await writer.write(new SnapshotBook().take(ts), DAY); // empty: no-op
+    const again = new SnapshotBook();
+    again.update(SID, { instrument_token: "K", last_price: 102, market_data: { oi: 70000 } });
+    await writer.write(again.take(ts), DAY); // restarted worker, same mark → overwrite
+    const { rows } = await owner.query(
+      "select tableoid::regclass::text as part, ltp, oi::int, bid, ask_qty, iv, delta from live_snapshots where sid = $1",
+      [SID],
+    );
+    expect(rows).toEqual([{ part: "live_snapshots_209912", ltp: 102, oi: 70000, bid: null, ask_qty: null, iv: null, delta: null }]);
+    expect(writer.written).toBe(2);
   });
 });

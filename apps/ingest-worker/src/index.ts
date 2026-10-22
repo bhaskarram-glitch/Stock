@@ -12,6 +12,7 @@ import { decideSession, istClock, parseHhMm } from "./providers/upstox/market-ca
 import { CandleAggregator, type CandleInterval } from "./services/candle-aggregator.js";
 import { LiveCandleSink } from "./services/live-candle-sink.js";
 import { LiveStream } from "./services/live-stream.js";
+import { LiveSnapshotWriter, nextSnapshotMark } from "./services/live-snapshots.js";
 import { describeDropped, loadLiveUniverse, planShards } from "./services/live-universe.js";
 
 const LIVE_INTERVALS: CandleInterval[] = ["1m", "5m", "15m", "1h"];
@@ -105,8 +106,10 @@ async function runWebsocketStream(config: ReturnType<typeof loadConfig>): Promis
     logger.info("Live stream stopping", { reason, ...stream.getStatus(), sink: sink.getStats() });
     clearInterval(statusTimer);
     clearTimeout(stopTimer);
+    clearTimeout(snapshotTimer);
     try {
       await stream.stop(); // writes every open candle before the pool closes
+      await snapshotWrites;
       await closeDb();
     } catch (error) {
       logger.error("Shutdown error", { error: error instanceof Error ? error.message : String(error) });
@@ -131,8 +134,30 @@ async function runWebsocketStream(config: ReturnType<typeof loadConfig>): Promis
   const nowMin = istClock(Date.now()).minutes;
   const stopInMs = Math.max(0, (stopMin - nowMin) * 60_000 - (Date.now() % 60_000));
   const stopTimer = setTimeout(() => void shutdown(`stop time ${config.live.stopTime} IST`, 0), stopInMs);
+  // 5-minute snapshots: at each mark, the state of every instrument that changed since its last one
+  const snapshotWriter = new LiveSnapshotWriter(db, (day) => sink.ensurePartitions(day));
+  let snapshotTimer: NodeJS.Timeout;
+  let snapshotWrites: Promise<void> = Promise.resolve();
+  const scheduleSnapshot = () => {
+    const mark = nextSnapshotMark(Date.now());
+    snapshotTimer = setTimeout(() => {
+      const rows = stream.snapshots.take(new Date(mark));
+      snapshotWrites = snapshotWrites
+        .then(() => snapshotWriter.write(rows, istClock(mark).date))
+        .then(() => logger.debug("Snapshot written", { at: new Date(mark).toISOString(), rows: rows.length }))
+        .catch((error) => logger.error("Snapshot write failed", { error: String(error) }));
+      scheduleSnapshot();
+    }, mark - Date.now());
+  };
+  scheduleSnapshot();
+
   const statusTimer = setInterval(
-    () => logger.info("Live status", { ...stream.getStatus(), sink: sink.getStats() }),
+    () =>
+      logger.info("Live status", {
+        ...stream.getStatus(),
+        sink: sink.getStats(),
+        snapshots: { written: snapshotWriter.written, failedBatches: snapshotWriter.failedBatches, instruments: stream.snapshots.size() },
+      }),
     60_000,
   );
   logger.info("Live stream started", { stopsAt: config.live.stopTime, stopInMin: Math.round(stopInMs / 60_000) });
